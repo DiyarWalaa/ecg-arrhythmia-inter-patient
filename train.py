@@ -19,9 +19,13 @@
 # =========================================================
 
 import os
+import json
 import random
+import datetime
 import numpy as np
 import wfdb
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -102,10 +106,13 @@ else:
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-DATA_DIR = os.path.join(
-    BASE_DIR,
-    "data",
-    "mit-bih-arrhythmia-database-1.0.0"
+DATA_DIR = os.environ.get(
+    "ECG_DATA_DIR",
+    os.path.join(
+        BASE_DIR,
+        "data",
+        "mit-bih-arrhythmia-database-1.0.0"
+    )
 )
 
 if not os.path.exists(DATA_DIR):
@@ -113,6 +120,29 @@ if not os.path.exists(DATA_DIR):
     raise FileNotFoundError(
         f"Dataset folder not found:\n{DATA_DIR}"
     )
+
+RUN_NAME = os.environ.get(
+    "ECG_RUN_NAME",
+    "baseline"
+)
+
+OUT_ROOT = os.environ.get(
+    "ECG_OUT_DIR",
+    os.path.join(BASE_DIR, "runs")
+)
+
+RUN_DIR = os.path.join(
+    OUT_ROOT,
+    RUN_NAME
+)
+
+os.makedirs(
+    RUN_DIR,
+    exist_ok=True
+)
+
+print(f"\nDATA_DIR: {DATA_DIR}")
+print(f"RUN_DIR : {RUN_DIR}")
 
 # Inter-patient split
 DS1 = [
@@ -564,7 +594,7 @@ plt.ylabel('Count')
 plt.tight_layout()
 
 plt.savefig(
-    'class_distribution.png',
+    os.path.join(RUN_DIR, 'class_distribution.png'),
     dpi=300
 )
 
@@ -922,7 +952,7 @@ plt.legend()
 plt.tight_layout()
 
 plt.savefig(
-    'training_curves.png',
+    os.path.join(RUN_DIR, 'training_curves.png'),
     dpi=300
 )
 
@@ -998,7 +1028,7 @@ plt.ylabel('True Label')
 plt.tight_layout()
 
 plt.savefig(
-    'confusion_matrix.png',
+    os.path.join(RUN_DIR, 'confusion_matrix.png'),
     dpi=300
 )
 
@@ -1016,6 +1046,8 @@ y_test_bin = label_binarize(
 
 plt.figure(figsize=(8, 6))
 
+per_class_roc_auc = {}
+
 for i in range(NUM_CLASSES):
 
     fpr, tpr, _ = roc_curve(
@@ -1024,6 +1056,8 @@ for i in range(NUM_CLASSES):
     )
 
     roc_auc = auc(fpr, tpr)
+
+    per_class_roc_auc[INT_TO_LABEL[i]] = float(roc_auc)
 
     plt.plot(
         fpr,
@@ -1044,7 +1078,7 @@ plt.legend()
 plt.tight_layout()
 
 plt.savefig(
-    'roc_curves.png',
+    os.path.join(RUN_DIR, 'roc_curves.png'),
     dpi=300
 )
 
@@ -1081,7 +1115,7 @@ plt.legend()
 plt.tight_layout()
 
 plt.savefig(
-    'precision_recall_curves.png',
+    os.path.join(RUN_DIR, 'precision_recall_curves.png'),
     dpi=300
 )
 
@@ -1109,7 +1143,7 @@ for i in range(3):
 plt.tight_layout()
 
 plt.savefig(
-    'sample_ecg_signals.png',
+    os.path.join(RUN_DIR, 'sample_ecg_signals.png'),
     dpi=300
 )
 
@@ -1120,10 +1154,119 @@ plt.show()
 # 29. SAVE MODEL
 # =========================================================
 
-model.save(
+MODEL_PATH = os.path.join(
+    RUN_DIR,
     "best_ecg_multiclass_model.keras"
 )
 
+model.save(MODEL_PATH)
+
 print(
-    "\nModel saved as best_ecg_multiclass_model.keras"
+    f"\nModel saved as {MODEL_PATH}"
 )
+
+
+# =========================================================
+# 30. SAVE METRICS AND HISTORY
+# =========================================================
+
+metrics = {
+
+    "run_name": RUN_NAME,
+
+    "timestamp": datetime.datetime.now().isoformat(),
+
+    "tensorflow_version": tf.__version__,
+
+    "gpus": [str(gpu) for gpu in gpus],
+
+    "config": {
+
+        "SEED": SEED,
+
+        "EPOCHS": EPOCHS,
+
+        "BATCH_SIZE": BATCH_SIZE,
+
+        "PRE_SAMPLES": PRE_SAMPLES,
+
+        "POST_SAMPLES": POST_SAMPLES,
+
+        "SEGMENT_LENGTH": SEGMENT_LENGTH,
+
+        "LEAD_INDEX": LEAD_INDEX,
+
+        "focal_loss_alpha": 0.50,
+
+        "focal_loss_gamma": 2.0,
+
+        "adam_learning_rate": 1e-4,
+
+        "DS1": DS1,
+
+        "DS2": DS2
+    },
+
+    "train_distribution": {
+        str(label): int(count)
+        for label, count in Counter(y_train).items()
+    },
+
+    "test_distribution": {
+        str(label): int(count)
+        for label, count in Counter(y_test).items()
+    },
+
+    "test_accuracy": float(acc),
+
+    "classification_report": classification_report(
+        y_test_encoded,
+        y_pred_enc,
+        target_names=[
+            'N',
+            'S',
+            'V'
+        ],
+        digits=4,
+        output_dict=True
+    ),
+
+    "confusion_matrix": cm.tolist(),
+
+    "per_class_roc_auc": per_class_roc_auc
+}
+
+METRICS_PATH = os.path.join(
+    RUN_DIR,
+    "metrics.json"
+)
+
+with open(METRICS_PATH, "w") as f:
+
+    json.dump(
+        metrics,
+        f,
+        indent=2
+    )
+
+print(f"Metrics saved as {METRICS_PATH}")
+
+HISTORY_PATH = os.path.join(
+    RUN_DIR,
+    "history.json"
+)
+
+history_serializable = {
+    key: [float(value) for value in values]
+    for key, values in history.history.items()
+}
+
+with open(HISTORY_PATH, "w") as f:
+
+    json.dump(
+        history_serializable,
+        f,
+        indent=2
+    )
+
+print(f"History saved as {HISTORY_PATH}")
