@@ -177,6 +177,28 @@ POST_SAMPLES = 144
 
 SEGMENT_LENGTH = PRE_SAMPLES + POST_SAMPLES
 
+# Patient-relative RR features (step 3).
+# Raw RR intervals in samples are not comparable across patients: 280
+# samples is early for a 60 bpm patient and late for a 100 bpm one. Every
+# feature below is a ratio, so it is dimensionless and self-referenced to
+# the patient's own rhythm. Uses only that patient's signal - never their
+# labels, never another patient - so the inter-patient constraint holds.
+RR_FEATURE_NAMES = [
+    'pre_RR_over_median',
+    'post_RR_over_median',
+    'local_RR_over_median',
+    'pre_RR_over_local',
+    'post_RR_over_pre'
+]
+
+# Mean of the previous N RR intervals, excluding the beat's own pre_RR.
+RR_LOCAL_WINDOW = 10
+
+# A missed annotation produces one enormous interval. Clipping stops a
+# single outlier from dominating a batch.
+RR_CLIP_MIN = 0.2
+RR_CLIP_MAX = 3.0
+
 LEAD_INDEX = 0
 
 BATCH_SIZE = 128
@@ -307,6 +329,17 @@ def extract_beats_from_record(
     ann_samples = annotation.sample
     ann_symbols = annotation.symbol
 
+    # Full RR series for this record, computed once.
+    # rr_series[k] = ann_samples[k + 1] - ann_samples[k], so the interval
+    # ending at beat i is rr_series[i - 1] and the one starting at beat i
+    # is rr_series[i].
+    rr_series = np.diff(ann_samples).astype(np.float64)
+
+    median_rr = float(np.median(rr_series)) if len(rr_series) else 0.0
+
+    if not np.isfinite(median_rr) or median_rr <= 0.0:
+        median_rr = 1.0
+
     beats = []
     labels = []
     rr_features = []
@@ -331,10 +364,40 @@ def extract_beats_from_record(
         if len(segment) != SEGMENT_LENGTH:
             continue
 
-        prev_rr = ann_samples[i] - ann_samples[i - 1]
-        next_rr = ann_samples[i + 1] - ann_samples[i]
+        pre_rr = float(rr_series[i - 1])
+        post_rr = float(rr_series[i])
 
-        rr = [prev_rr, next_rr]
+        # The RR_LOCAL_WINDOW intervals immediately BEFORE this beat's own
+        # pre_RR: rr_series[i - 1 - W : i - 1]. Excluding pre_RR is what
+        # makes pre_RR / local_RR a prematurity measure rather than a
+        # self-comparison. Too few preceding intervals -> fall back to the
+        # record median.
+        window_start = i - 1 - RR_LOCAL_WINDOW
+
+        if window_start >= 0:
+            local_rr = float(np.mean(rr_series[window_start:i - 1]))
+        else:
+            local_rr = median_rr
+
+        if not np.isfinite(local_rr) or local_rr <= 0.0:
+            local_rr = median_rr
+
+        # pre_rr can only be <= 0 with corrupt annotations; fall back so
+        # feature 5 never divides by zero.
+        pre_rr_denom = pre_rr if pre_rr > 0.0 else median_rr
+
+        rr = [
+            pre_rr / median_rr,
+            post_rr / median_rr,
+            local_rr / median_rr,
+            pre_rr / local_rr,
+            post_rr / pre_rr_denom
+        ]
+
+        rr = [
+            float(np.clip(value, RR_CLIP_MIN, RR_CLIP_MAX))
+            for value in rr
+        ]
 
         segment = normalize_segment(segment)
 
@@ -703,6 +766,23 @@ y_test_encoded = np.array([
 # step 1 behaviour) put the three on three different scales, which is why
 # step 1 val_accuracy peaked at 0.7368, below the 0.8528 an all-N
 # prediction scores on that validation set.
+# Raw ratio ranges on DS1_TRAIN, before standardising. If a feature sits
+# hard against RR_CLIP_MIN or RR_CLIP_MAX the clip is saturating and the
+# bounds need revisiting.
+print("\nDS1_TRAIN raw RR ratio features "
+      f"(clipped to [{RR_CLIP_MIN}, {RR_CLIP_MAX}]):")
+print(f"  {'feature':<24} {'min':>8} {'max':>8} {'mean':>8} "
+      f"{'%at_min':>8} {'%at_max':>8}")
+
+for _i, _name in enumerate(RR_FEATURE_NAMES):
+
+    _col = RR_train[:, _i]
+
+    print(f"  {_name:<24} {_col.min():>8.4f} {_col.max():>8.4f} "
+          f"{_col.mean():>8.4f} "
+          f"{100.0 * np.mean(_col <= RR_CLIP_MIN):>7.2f}% "
+          f"{100.0 * np.mean(_col >= RR_CLIP_MAX):>7.2f}%")
+
 RR_NORM_MEAN, RR_NORM_STD = fit_rr_norm(RR_train)
 
 print("\nRR normalization fitted on DS1_TRAIN only:")
@@ -943,7 +1023,7 @@ def build_model(ecg_shape, rr_shape):
 
 model = build_model(
     ecg_shape=X_tr_aug.shape[1:],
-    rr_shape=(2,)
+    rr_shape=(len(RR_FEATURE_NAMES),)
 )
 
 model.summary()
@@ -1506,6 +1586,12 @@ metrics = {
         "ds1_train": DS1_TRAIN,
 
         "ds1_val": DS1_VAL,
+
+        "rr_feature_names": RR_FEATURE_NAMES,
+
+        "rr_local_window": RR_LOCAL_WINDOW,
+
+        "rr_clip": [RR_CLIP_MIN, RR_CLIP_MAX],
 
         "rr_norm_mean": RR_NORM_MEAN.tolist(),
 
