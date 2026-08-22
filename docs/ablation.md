@@ -12,6 +12,7 @@ DS2. All metrics below are on DS2 (inter-patient test set).
 | 1 | patient-wise validation split (DS1_VAL = 207,220,223) | `ae9a91c` | 0.4569 | 0.0065 | 0.2000 | 0.0127 | 0.4215 | 0.8682 |
 | 1b | RR normalization fitted on training set only | `10e06f2` | 0.4742 | 0.0071 | 0.1806 | 0.0136 | 0.4641 | 0.8843 |
 | 2 | select on val macro-F1 instead of val_loss | `5c1b9d6` | 0.6800 | 0.1280 | 0.4024 | 0.1942 | 0.8718 | 0.9476 |
+| 3 | patient-relative RR ratio features (5 dimensionless) | `1a2509c` | 0.6645 | 0.1514 | 0.3634 | 0.2138 | 0.8004 | 0.9451 |
 
 ## Notes
 
@@ -27,6 +28,9 @@ DS2. All metrics below are on DS2 (inter-patient test set).
 - **step 2** (`step2_macrof1_selection`) - train distribution N=40301 / S=670 / V=3105. Ran 24 epochs; selection on `val_macro_f1` chose **epoch 14** (best val macro-F1 0.5460); early stopping fired: True.
   First run whose evaluated model trained for more than one epoch. Per-record validation exposed record **207** as a severe outlier: N recall 0.0700, S recall 0.0000, accuracy 0.1647, against 0.9780 and 0.9602 on 220 and 223. Still 1350 of 1836 test S beats (73.5%) predicted as N.
 
+- **step 3** (`step3_rr_ratios`) - train distribution N=40301 / S=670 / V=3105. Ran 18 epochs; selection on `val_macro_f1` chose **epoch 8** (best val macro-F1 0.5618); early stopping fired: True.
+  **macro-F1 REGRESSED 0.6800 -> 0.6645.** But the S->N leak roughly halved: 1350 -> 692 of 1836 test S beats. Those beats did not become correct S predictions - they moved to **V** instead (S->V 251 -> 866), and V F1 fell 0.8718 -> 0.8004. S recall did rise 0.1280 -> 0.1514 and S F1 0.1942 -> 0.2138, so the ratio features do carry usable prematurity signal; the model is simply spending it on the wrong class boundary. **Stated condition: if step 4 does not recover macro-F1 above 0.6800, the ratio features get reconsidered.**
+
 ## Reading these numbers
 
 Steps 1 and 1b both **evaluated a one-epoch model**: `val_loss` rose
@@ -41,5 +45,8 @@ is the correct comparison point for everything that follows - not the
 baseline, whose 0.6358 came from a leaked validation split and the full
 22-record training pool.
 
-The remaining problem is unchanged since the baseline: S beats are classified
-as N. 73.5% of test S beats still land in the N column.
+Step 3 is the first step to move the S->N leak (73.5% -> 37.7%), at the cost
+of macro-F1, because the freed S beats went to V rather than to S. Step 4
+tests whether that is a class-balancing problem rather than a feature problem:
+it removes duplicate oversampling and replaces the scalar focal alpha (which
+rebalanced nothing) with a per-class vector.

@@ -199,6 +199,17 @@ RR_LOCAL_WINDOW = 10
 RR_CLIP_MIN = 0.2
 RR_CLIP_MAX = 3.0
 
+# Loss settings (step 4).
+# Focal alpha is a PER-CLASS vector, derived at runtime from the DS1_TRAIN
+# counts as (1 / count_c) ** FOCAL_BETA, rescaled to sum to NUM_CLASSES.
+# It was previously the scalar 0.50, which multiplies every class by the
+# same factor and rebalances nothing - it just halved the effective loss.
+FOCAL_BETA = 0.5
+
+FOCAL_GAMMA = 2.0
+
+ADAM_LEARNING_RATE = 1e-4
+
 LEAD_INDEX = 0
 
 BATCH_SIZE = 128
@@ -462,8 +473,12 @@ def load_dataset(
 
 
 # =========================================================
-# 9. ECG AUGMENTATION
+# 9. ECG AUGMENTATION  [DEPRECATED - unused since step 4]
 # =========================================================
+
+# DEPRECATED. Not called anywhere. Kept only so earlier runs in
+# docs/ablation.md remain readable against this file. Do not re-enable:
+# synthetic beats violate hard constraint 2 (no data expansion).
 
 def augment_segment(segment):
 
@@ -511,8 +526,13 @@ def augment_segment(segment):
 
 
 # =========================================================
-# 10. TARGETED AUGMENTATION
+# 10. TARGETED AUGMENTATION  [DEPRECATED - unused since step 4]
 # =========================================================
+
+# DEPRECATED. augment_training_data() is no longer called; section 18
+# passes the training arrays straight through. It expanded S x7 / V x3 with
+# duplicated RR vectors, which violates hard constraint 2. Class balancing
+# is done in the loss now (FOCAL_ALPHA). Do not re-enable.
 
 def augment_training_data(
     X,
@@ -598,9 +618,24 @@ def augment_training_data(
 # =========================================================
 
 def categorical_focal_loss(
-    alpha=0.50,
+    alpha,
     gamma=2.0
 ):
+    """Multiclass focal loss with a PER-CLASS alpha vector.
+
+    alpha must be a sequence of length NUM_CLASSES. y_pred is
+    (batch, n_classes), so a (n_classes,) alpha broadcasts over the class
+    axis and each class gets its own weight.
+
+    alpha is deliberately required, not defaulted: the old signature
+    defaulted to the scalar 0.50, which applied the same factor to all
+    three classes and therefore performed no rebalancing at all.
+    """
+
+    alpha = tf.constant(
+        alpha,
+        dtype=tf.float32
+    )
 
     def loss(y_true, y_pred):
 
@@ -706,6 +741,38 @@ print(Counter(y_valid))
 
 print("\nOriginal Test Distribution:")
 print(Counter(y_test))
+
+
+# --- per-class focal alpha, derived from DS1_TRAIN counts only ----------
+# Uses training counts only - no validation or test information.
+
+_train_counts = Counter(y_train)
+
+FOCAL_CLASS_COUNTS = [
+    int(_train_counts[INT_TO_LABEL[_i]])
+    for _i in range(NUM_CLASSES)
+]
+
+_alpha_raw = np.array(
+    [
+        (1.0 / _count) ** FOCAL_BETA if _count > 0 else 0.0
+        for _count in FOCAL_CLASS_COUNTS
+    ],
+    dtype=np.float64
+)
+
+FOCAL_ALPHA = (
+    _alpha_raw * (NUM_CLASSES / _alpha_raw.sum())
+).astype(np.float32)
+
+print(f"\nFocal alpha (per class, beta={FOCAL_BETA}, "
+      f"rescaled to sum {NUM_CLASSES}):")
+
+for _i in range(NUM_CLASSES):
+    print(f"  {INT_TO_LABEL[_i]}: count {FOCAL_CLASS_COUNTS[_i]:>6}  "
+          f"alpha {FOCAL_ALPHA[_i]:.4f}")
+
+print(f"  vector: {FOCAL_ALPHA.tolist()}  (sum {FOCAL_ALPHA.sum():.4f})")
 
 
 # =========================================================
@@ -839,14 +906,27 @@ print(f"\nTrain beats: {len(y_tr)}   Validation beats: {len(y_val)}")
 
 
 # =========================================================
-# 18. AUGMENT TRAINING DATA
+# 18. AUGMENT TRAINING DATA (REMOVED - step 4)
 # =========================================================
 
-X_tr_aug, RR_tr_aug, y_tr_aug = augment_training_data(
-    X_tr,
-    RR_tr,
-    y_tr
-)
+# Duplicate oversampling is gone. It expanded S x7 and V x3 while copying
+# the RR feature vector UNCHANGED across every copy, so six of every seven
+# S training examples carried identical rhythm context - teaching the model
+# to memorise specific training rhythms instead of the relative-timing
+# rule the step 3 features encode. The np.roll time shift also moved the
+# R-peak off its aligned position. It violated hard constraint 2.
+#
+# Class balancing now happens in the loss instead, via the per-class
+# FOCAL_ALPHA vector derived in section 12.
+#
+# The *_aug names are kept so nothing downstream needs to change.
+
+X_tr_aug = X_tr
+RR_tr_aug = RR_tr
+y_tr_aug = y_tr
+
+print(f"\nTraining samples (no oversampling): {len(y_tr_aug)}")
+print(f"Training distribution: {Counter(y_tr_aug)}")
 
 
 # =========================================================
@@ -1007,12 +1087,12 @@ def build_model(ecg_shape, rr_shape):
     model.compile(
 
         optimizer=tf.keras.optimizers.Adam(
-            learning_rate=1e-4
+            learning_rate=ADAM_LEARNING_RATE
         ),
 
         loss=categorical_focal_loss(
-            alpha=0.50,
-            gamma=2.0
+            alpha=FOCAL_ALPHA,
+            gamma=FOCAL_GAMMA
         ),
 
         metrics=['accuracy']
@@ -1573,11 +1653,17 @@ metrics = {
 
         "LEAD_INDEX": LEAD_INDEX,
 
-        "focal_loss_alpha": 0.50,
+        "focal_loss_alpha": FOCAL_ALPHA.tolist(),
 
-        "focal_loss_gamma": 2.0,
+        "focal_loss_beta": FOCAL_BETA,
 
-        "adam_learning_rate": 1e-4,
+        "focal_loss_gamma": FOCAL_GAMMA,
+
+        "focal_alpha_class_counts": FOCAL_CLASS_COUNTS,
+
+        "oversampling": False,
+
+        "adam_learning_rate": ADAM_LEARNING_RATE,
 
         "DS1": DS1,
 
