@@ -58,7 +58,8 @@ from sklearn.metrics import (
     accuracy_score,
     roc_curve,
     auc,
-    precision_recall_curve
+    precision_recall_curve,
+    precision_recall_fscore_support
 )
 
 from sklearn.preprocessing import label_binarize
@@ -586,13 +587,37 @@ X_train, y_train, RR_train = load_dataset(
 
 print("\nLoading DS1_VAL (validation) ...")
 
-X_valid, y_valid, RR_valid = load_dataset(
-    DS1_VAL,
-    DATA_DIR,
-    PRE_SAMPLES,
-    POST_SAMPLES,
-    LEAD_INDEX
-)
+# Loaded one record at a time so every validation beat keeps its record
+# id. That is what makes the per-record breakdown after training possible.
+# Concatenating in DS1_VAL order produces exactly the arrays a single
+# load_dataset(DS1_VAL, ...) call would return - same records, same order,
+# same beats.
+X_valid_parts = []
+y_valid_parts = []
+RR_valid_parts = []
+val_record_ids = []
+
+for rec in DS1_VAL:
+
+    X_rec, y_rec, RR_rec = load_dataset(
+        [rec],
+        DATA_DIR,
+        PRE_SAMPLES,
+        POST_SAMPLES,
+        LEAD_INDEX
+    )
+
+    X_valid_parts.append(X_rec)
+    y_valid_parts.append(y_rec)
+    RR_valid_parts.append(RR_rec)
+
+    val_record_ids.extend([rec] * len(y_rec))
+
+X_valid = np.concatenate(X_valid_parts, axis=0)
+y_valid = np.concatenate(y_valid_parts, axis=0)
+RR_valid = np.concatenate(RR_valid_parts, axis=0)
+
+val_record_ids = np.array(val_record_ids)
 
 print("\nLoading DS2 (test) ...")
 
@@ -928,20 +953,122 @@ model.summary()
 # 21. CALLBACKS
 # =========================================================
 
+class ValidationMetrics(tf.keras.callbacks.Callback):
+    """Per-epoch macro-F1 and per-class metrics on the validation set.
+
+    Aggregate val_accuracy is not a usable selection signal here: N is
+    85.3% of DS1_VAL, so a model that never predicts S can still look
+    fine. val_loss is worse still - under focal loss it climbs while
+    accuracy stays flat, because the model becomes more confidently wrong
+    rather than less correct.
+
+    Writes 'val_macro_f1' and 'val_f1_N' / 'val_f1_S' / 'val_f1_V' into
+    the logs dict, so EarlyStopping, ReduceLROnPlateau and History all
+    see them.
+    """
+
+    def __init__(self, x_val, y_val_int, class_names):
+
+        super().__init__()
+
+        self.x_val = x_val
+        self.y_val_int = np.asarray(y_val_int)
+        self.class_names = list(class_names)
+        self.records = []
+
+    def on_epoch_end(self, epoch, logs=None):
+
+        if logs is None:
+            logs = {}
+
+        y_pred = np.argmax(
+            self.model.predict(self.x_val, verbose=0),
+            axis=1
+        )
+
+        labels = list(range(len(self.class_names)))
+
+        precision, recall, f1, support = precision_recall_fscore_support(
+            self.y_val_int,
+            y_pred,
+            labels=labels,
+            zero_division=0
+        )
+
+        macro_f1 = float(np.mean(f1))
+
+        # Into logs so the other callbacks can monitor them.
+        logs['val_macro_f1'] = macro_f1
+
+        for i, name in enumerate(self.class_names):
+            logs[f'val_f1_{name}'] = float(f1[i])
+
+        cm = confusion_matrix(
+            self.y_val_int,
+            y_pred,
+            labels=labels
+        )
+
+        self.records.append({
+            "epoch": int(epoch) + 1,
+            "val_macro_f1": macro_f1,
+            "val_f1": {
+                n: float(f1[i]) for i, n in enumerate(self.class_names)
+            },
+            "val_recall": {
+                n: float(recall[i]) for i, n in enumerate(self.class_names)
+            },
+            "val_precision": {
+                n: float(precision[i]) for i, n in enumerate(self.class_names)
+            },
+            "val_support": {
+                n: int(support[i]) for i, n in enumerate(self.class_names)
+            },
+            "val_confusion_matrix": cm.tolist()
+        })
+
+        print(
+            f"  epoch {epoch + 1:>3}  val macro-F1 {macro_f1:.4f}   "
+            + "  ".join(
+                f"{n}-F1 {f1[i]:.4f}"
+                for i, n in enumerate(self.class_names)
+            )
+        )
+
+
+CLASS_NAMES = [INT_TO_LABEL[i] for i in range(NUM_CLASSES)]
+
+val_metrics_cb = ValidationMetrics(
+    [X_val, RR_val],
+    y_val,
+    CLASS_NAMES
+)
+
+early_stopping = EarlyStopping(
+    monitor='val_macro_f1',
+    mode='max',
+    patience=10,
+    restore_best_weights=True
+)
+
+reduce_lr = ReduceLROnPlateau(
+    monitor='val_macro_f1',
+    mode='max',
+    factor=0.5,
+    patience=5,
+    min_lr=1e-6
+)
+
+# val_metrics_cb MUST be first: it writes 'val_macro_f1' into the shared
+# logs dict, and the two callbacks below read that key in the same
+# on_epoch_end pass.
 callbacks = [
 
-    EarlyStopping(
-        monitor='val_loss',
-        patience=7,
-        restore_best_weights=True
-    ),
+    val_metrics_cb,
 
-    ReduceLROnPlateau(
-        monitor='val_loss',
-        factor=0.5,
-        patience=3,
-        min_lr=1e-6
-    )
+    early_stopping,
+
+    reduce_lr
 ]
 
 
@@ -967,6 +1094,108 @@ history = model.fit(
 
     verbose=1
 )
+
+
+# =========================================================
+# 22B. VALIDATION DIAGNOSTICS
+# =========================================================
+
+val_epoch_records = val_metrics_cb.records
+
+if val_epoch_records:
+
+    best_record = max(
+        val_epoch_records,
+        key=lambda r: r["val_macro_f1"]
+    )
+
+    BEST_EPOCH = int(best_record["epoch"])
+    BEST_VAL_MACRO_F1 = float(best_record["val_macro_f1"])
+
+else:
+
+    BEST_EPOCH = None
+    BEST_VAL_MACRO_F1 = None
+
+# restore_best_weights only actually restores when EarlyStopping fires.
+# If training runs to the final epoch the last weights are kept, so record
+# what happened rather than assuming BEST_EPOCH is what got evaluated.
+EARLY_STOPPED_EPOCH = int(early_stopping.stopped_epoch)
+WEIGHTS_RESTORED = EARLY_STOPPED_EPOCH > 0
+
+print("\nValidation model selection:")
+print(f"  epochs run                 : {len(val_epoch_records)}")
+print(f"  best epoch by val macro-F1 : {BEST_EPOCH}")
+print(f"  best val macro-F1          : {BEST_VAL_MACRO_F1}")
+print(f"  early stopping fired       : {WEIGHTS_RESTORED}"
+      f"  (stopped_epoch={EARLY_STOPPED_EPOCH})")
+
+if not WEIGHTS_RESTORED:
+    print("  NOTE: training reached the last epoch, so the FINAL weights "
+          "are in the model, not the best-epoch weights.")
+
+# --- per-record breakdown on the model actually being evaluated ---------
+# Is one validation record an outlier, or do all three behave the same?
+
+y_val_pred = np.argmax(
+    model.predict([X_val, RR_val], verbose=0),
+    axis=1
+)
+
+val_per_record = {}
+
+print("\nPer-record validation breakdown:")
+
+for rec in DS1_VAL:
+
+    mask = (val_record_ids == rec)
+
+    y_true_rec = y_val[mask]
+    y_pred_rec = y_val_pred[mask]
+
+    rec_labels = list(range(NUM_CLASSES))
+
+    p_rec, r_rec, f_rec, sup_rec = precision_recall_fscore_support(
+        y_true_rec,
+        y_pred_rec,
+        labels=rec_labels,
+        zero_division=0
+    )
+
+    entry = {
+        "n_beats": int(mask.sum()),
+        "accuracy": float(np.mean(y_true_rec == y_pred_rec)),
+        "macro_f1": float(np.mean(f_rec)),
+        "support": {
+            INT_TO_LABEL[i]: int(sup_rec[i]) for i in rec_labels
+        },
+        "recall": {
+            INT_TO_LABEL[i]: float(r_rec[i]) for i in rec_labels
+        },
+        "precision": {
+            INT_TO_LABEL[i]: float(p_rec[i]) for i in rec_labels
+        },
+        "f1": {
+            INT_TO_LABEL[i]: float(f_rec[i]) for i in rec_labels
+        },
+        "confusion_matrix": confusion_matrix(
+            y_true_rec,
+            y_pred_rec,
+            labels=rec_labels
+        ).tolist()
+    }
+
+    val_per_record[rec] = entry
+
+    print(
+        f"  record {rec}: {entry['n_beats']:>5} beats  "
+        f"acc {entry['accuracy']:.4f}  macro-F1 {entry['macro_f1']:.4f}   "
+        + "  ".join(
+            f"{INT_TO_LABEL[i]} n={sup_rec[i]:>4} "
+            f"rec={r_rec[i]:.4f}"
+            for i in rec_labels
+        )
+    )
 
 
 # =========================================================
@@ -1309,7 +1538,15 @@ metrics = {
 
     "confusion_matrix": cm.tolist(),
 
-    "per_class_roc_auc": per_class_roc_auc
+    "per_class_roc_auc": per_class_roc_auc,
+
+    "best_epoch": BEST_EPOCH,
+
+    "best_val_macro_f1": BEST_VAL_MACRO_F1,
+
+    "early_stopping_fired": WEIGHTS_RESTORED,
+
+    "val_per_record": val_per_record
 }
 
 METRICS_PATH = os.path.join(
@@ -1336,6 +1573,11 @@ history_serializable = {
     key: [float(value) for value in values]
     for key, values in history.history.items()
 }
+
+# The scalar Keras logs above already carry val_macro_f1 and val_f1_N/S/V
+# because the callback wrote them into logs. This adds the rest: per-class
+# recall, precision, support and the validation confusion matrix per epoch.
+history_serializable["val_metrics_per_epoch"] = val_epoch_records
 
 with open(HISTORY_PATH, "w") as f:
 
