@@ -1,0 +1,273 @@
+{
+  "per_record": [
+    {
+      "record": "101",
+      "N": 1858,
+      "S": 3,
+      "V": 0,
+      "total": 1861,
+      "leads": [
+        "MLII",
+        "V1"
+      ],
+      "skipped_edge": 1
+    },
+    {
+      "record": "106",
+      "N": 1506,
+      "S": 0,
+      "V": 520,
+      "total": 2026,
+      "leads": [
+        "MLII",
+        "V1"
+      ],
+      "skipped_edge": 0
+    },
+    {
+      "record": "108",
+      "N": 1738,
+      "S": 4,
+      "V": 17,
+      "total": 1759,
+      "leads": [
+        "MLII",
+        "V1"
+      ],
+      "skipped_edge": 1
+    },
+    {
+      "record": "109",
+      "N": 2491,
+      "S": 0,
+      "V": 38,
+      "total": 2529,
+      "leads": [
+        "MLII",
+        "V1"
+      ],
+      "skipped_edge": 0
+    },
+    {
+      "record": "112",
+      "N": 2536,
+      "S": 2,
+      "V": 0,
+      "total": 2538,
+      "leads": [
+        "MLII",
+        "V1"
+      ],
+      "skipped_edge": 0
+    },
+    {
+      "record": "114",
+      "N": 1819,
+      "S": 12,
+      "V": 43,
+      "total": 1874,
+      "leads": [
+        "V5",
+        "MLII"
+      ],
+      "skipped_edge": 0
+    },
+    {
+      "record": "115",
+      "N": 1952,
+      "S": 0,
+      "V": 0,
+      "total": 1952,
+      "leads": [
+        "MLII",
+        "V1"
+      ],
+      "skipped_edge": 0
+    },
+    {
+      "record": "116",
+      "N": 2301,
+      "S": 1,
+      "V": 109,
+      "total": 2411,
+      "leads": [
+        "MLII",
+        "V1"
+      ],
+      "skipped_edge": 0
+    },
+    {
+      "record": "118",
+      "N": 2164,
+      "S": 96,
+      "V": 16,
+      "total": 2276,
+      "leads": [
+        "MLII",
+        "V1"
+      ],
+      "skipped_edge": 1
+    },
+    {
+      "record": "119",
+      "N": 1542,
+      "S": 0,
+      "V": 444,
+      "total": 1986,
+      "leads": [
+        "MLII",
+        "V1"
+      ],
+      "skipped_edge": 0
+    },
+    {
+      "record": "122",
+      "N": 2475,
+      "S": 0,
+      "V": 0,
+      "total": 2475,
+      "leads": [
+        "MLII",
+        "V1"
+      ],
+      "skipped_edge": 0
+    },
+    {
+      "record": "124",
+      "N": 1535,
+      "S": 31,
+      "V": 47,
+      "total": 1613,
+      "leads": [
+        "MLII",
+        "V4"
+      ],
+      "skipped_edge": 0
+    },
+    {
+      "record": "201",
+      "N": 1634,
+      "S": 128,
+      "V": 198,
+      "total": 1960,
+      "leads": [
+        "MLII",
+        "V1"
+      ],
+      "skipped_edge": 0
+    },
+    {
+      "record": "203",
+      "N": 2528,
+      "S": 2,
+      "V": 444,
+      "total": 2974,
+      "leads": [
+        "MLII",
+        "V1"
+      ],
+      "skipped_edge": 0
+    },
+    {
+      "record": "205",
+      "N": 2570,
+      "S": 3,
+      "V": 71,
+      "total": 2644,
+      "leads": [
+        "MLII",
+        "V1"
+      ],
+      "skipped_edge": 0
+    },
+    {
+      "record": "207",
+      "N": 1542,
+      "S": 106,
+      "V": 210,
+      "total": 1858,
+      "leads": [
+        "MLII",
+        "V1"
+      ],
+      "skipped_edge": 1
+    },
+    {
+      "record": "208",
+      "N": 1585,
+      "S": 2,
+      "V": 992,
+      "total": 2579,
+      "leads": [
+        "MLII",
+        "V1"
+      ],
+      "skipped_edge": 0
+    },
+    {
+      "record": "209",
+      "N": 2620,
+      "S": 383,
+      "V": 1,
+      "total": 3004,
+      "leads": [
+        "MLII",
+        "V1"
+      ],
+      "skipped_edge": 0
+    },
+    {
+      "record": "215",
+      "N": 3194,
+      "S": 3,
+      "V": 164,
+      "total": 3361,
+      "leads": [
+        "MLII",
+        "V1"
+      ],
+      "skipped_edge": 0
+    },
+    {
+      "record": "220",
+      "N": 1952,
+      "S": 94,
+      "V": 0,
+      "total": 2046,
+      "leads": [
+        "MLII",
+        "V1"
+      ],
+      "skipped_edge": 1
+    },
+    {
+      "record": "223",
+      "N": 2044,
+      "S": 73,
+      "V": 473,
+      "total": 2590,
+      "leads": [
+        "MLII",
+        "V1"
+      ],
+      "skipped_edge": 0
+    },
+    {
+      "record": "230",
+      "N": 2253,
+      "S": 0,
+      "V": 1,
+      "total": 2254,
+      "leads": [
+        "MLII",
+        "V1"
+      ],
+      "skipped_edge": 1
+    }
+  ],
+  "totals": {
+    "N": 45839,
+    "S": 943,
+    "V": 3788
+  }
+}

@@ -104,7 +104,8 @@ else:
 # 3. SETTINGS
 # =========================================================
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# This file lives in src/, so the project root is one level up.
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 DATA_DIR = os.environ.get(
     "ECG_DATA_DIR",

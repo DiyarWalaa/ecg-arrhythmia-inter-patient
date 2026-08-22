@@ -1,0 +1,43 @@
+DATA_DIR: C:\Users\athar\OneDrive\Documents\research\time_series\data\mit-bih-arrhythmia-database-1.0.0
+
+ record       N       S       V   total    S share  leads
+------------------------------------------------------------------------
+    101    1858       3       0    1861     0.16%  ['MLII', 'V1']
+    106    1506       0     520    2026     0.00%  ['MLII', 'V1']
+    108    1738       4      17    1759     0.23%  ['MLII', 'V1']
+    109    2491       0      38    2529     0.00%  ['MLII', 'V1']
+    112    2536       2       0    2538     0.08%  ['MLII', 'V1']
+    114    1819      12      43    1874     0.64%  ['V5', 'MLII']
+    115    1952       0       0    1952     0.00%  ['MLII', 'V1']
+    116    2301       1     109    2411     0.04%  ['MLII', 'V1']
+    118    2164      96      16    2276     4.22%  ['MLII', 'V1']
+    119    1542       0     444    1986     0.00%  ['MLII', 'V1']
+    122    2475       0       0    2475     0.00%  ['MLII', 'V1']
+    124    1535      31      47    1613     1.92%  ['MLII', 'V4']
+    201    1634     128     198    1960     6.53%  ['MLII', 'V1']
+    203    2528       2     444    2974     0.07%  ['MLII', 'V1']
+    205    2570       3      71    2644     0.11%  ['MLII', 'V1']
+    207    1542     106     210    1858     5.71%  ['MLII', 'V1']
+    208    1585       2     992    2579     0.08%  ['MLII', 'V1']
+    209    2620     383       1    3004    12.75%  ['MLII', 'V1']
+    215    3194       3     164    3361     0.09%  ['MLII', 'V1']
+    220    1952      94       0    2046     4.59%  ['MLII', 'V1']
+    223    2044      73     473    2590     2.82%  ['MLII', 'V1']
+    230    2253       0       1    2254     0.00%  ['MLII', 'V1']
+------------------------------------------------------------------------
+  TOTAL   45839     943    3788   50570
+
+Lead check:
+  record 114: channel 0 is V5, not MLII  -> leads = ['V5', 'MLII']
+
+DS1 records ranked by S-beat count:
+  209: 383 S beats  (3004 total)
+  201: 128 S beats  (1960 total)
+  207: 106 S beats  (1858 total)
+  118: 96 S beats  (2276 total)
+  220: 94 S beats  (2046 total)
+  223: 73 S beats  (2590 total)
+  124: 31 S beats  (1613 total)
+  114: 12 S beats  (1874 total)
+
+Saved: C:\Users\athar\OneDrive\Documents\research\time_series\tools\ds1_beat_counts.json
