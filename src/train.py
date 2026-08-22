@@ -238,15 +238,33 @@ def normalize_segment(segment):
     return (segment - mean) / std
 
 
-def normalize_rr(rr_array):
+def fit_rr_norm(rr_array):
+    """Fit per-column RR statistics on the TRAINING set only.
+
+    RR is [prev_rr, next_rr], so the statistics are per column (axis=0),
+    not one scalar over both columns as before. Returns (mean, std), each
+    shape (2,). A zero-variance column gets std 1.0 so it is only centred,
+    never divided by zero.
+    """
 
     rr_array = np.array(rr_array, dtype=np.float32)
 
-    mean = np.mean(rr_array)
-    std = np.std(rr_array)
+    mean = np.mean(rr_array, axis=0)
+    std = np.std(rr_array, axis=0)
 
-    if std == 0:
-        return rr_array - mean
+    std = np.where(std == 0.0, 1.0, std)
+
+    return mean.astype(np.float32), std.astype(np.float32)
+
+
+def apply_rr_norm(rr_array, mean, std):
+    """Apply already-fitted RR statistics.
+
+    Never fits. Validation and test are scaled with the training set's
+    mean and std so all three land on the same scale.
+    """
+
+    rr_array = np.array(rr_array, dtype=np.float32)
 
     return (rr_array - mean) / std
 
@@ -655,9 +673,20 @@ y_test_encoded = np.array([
 # 15. NORMALIZE RR
 # =========================================================
 
-RR_train = normalize_rr(RR_train)
-RR_valid = normalize_rr(RR_valid)
-RR_test = normalize_rr(RR_test)
+# Fitted on DS1_TRAIN only. Fitting on validation or test would leak
+# their distribution into the pipeline; fitting each set separately (the
+# step 1 behaviour) put the three on three different scales, which is why
+# step 1 val_accuracy peaked at 0.7368, below the 0.8528 an all-N
+# prediction scores on that validation set.
+RR_NORM_MEAN, RR_NORM_STD = fit_rr_norm(RR_train)
+
+print("\nRR normalization fitted on DS1_TRAIN only:")
+print(f"  mean (prev_rr, next_rr): {RR_NORM_MEAN.tolist()}")
+print(f"  std  (prev_rr, next_rr): {RR_NORM_STD.tolist()}")
+
+RR_train = apply_rr_norm(RR_train, RR_NORM_MEAN, RR_NORM_STD)
+RR_valid = apply_rr_norm(RR_valid, RR_NORM_MEAN, RR_NORM_STD)
+RR_test = apply_rr_norm(RR_test, RR_NORM_MEAN, RR_NORM_STD)
 
 
 # =========================================================
@@ -1247,7 +1276,11 @@ metrics = {
 
         "ds1_train": DS1_TRAIN,
 
-        "ds1_val": DS1_VAL
+        "ds1_val": DS1_VAL,
+
+        "rr_norm_mean": RR_NORM_MEAN.tolist(),
+
+        "rr_norm_std": RR_NORM_STD.tolist()
     },
 
     "train_distribution": {
