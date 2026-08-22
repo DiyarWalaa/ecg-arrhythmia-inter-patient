@@ -1,7 +1,6 @@
 # Last report
 
-**Tasks:** (A) correct a factual error in CLAUDE.md, (B) step 1 - patient-wise
-validation split.
+**Task:** step 1b - fit RR normalization on the training set only.
 
 **Date:** 2026-08-22
 
@@ -9,70 +8,39 @@ validation split.
 
 ## What changed
 
-### Task A - CLAUDE.md correction
+- Replaced `normalize_rr()` with two functions in section 6:
+  - `fit_rr_norm(rr_array)` - computes mean and std **per column**
+    (`axis=0`, so `prev_rr` and `next_rr` get their own statistics rather
+    than one scalar over both columns and all rows), returns a `(2,)` mean
+    and a `(2,)` std, and replaces any zero std with `1.0` so a
+    zero-variance column is centred but never divided by zero.
+  - `apply_rr_norm(rr_array, mean, std)` - applies already-fitted
+    statistics. It cannot fit, by construction.
+- Section 15 now fits **once on `RR_train` (DS1_TRAIN) only** and applies
+  those same two vectors to `RR_train`, `RR_valid` and `RR_test`. All three
+  sets now land on one scale, and no validation or test statistic enters the
+  pipeline.
+- The fitted values are printed, labelled by column.
+- Added `config.rr_norm_mean` and `config.rr_norm_std` to `metrics.json`, as
+  lists.
+- `normalize_rr` is gone entirely - `grep` returns no occurrences, so no dead
+  function is left behind.
+- `normalize_segment()` (the per-beat ECG normalizer used inside
+  `extract_beats_from_record` and `augment_segment`) was **not** touched.
+  Verified by AST comparison, not by eye.
 
-- The "Landmine" note claimed `augment_training_data()` was dead code. **That
-  was wrong.** It is called at `src/train.py` section 18 (line 711 after this
-  change), and its output `X_tr_aug / RR_tr_aug / y_tr_aug` is what actually
-  feeds `build_model` and `model.fit`.
-- My earlier grep pattern matched only `def .*augment` and the bare names
-  `augment_segment` / `augment_dataset`, so it never looked for
-  `augment_training_data` as a call. The distribution cross-check I offered as
-  corroboration was worthless: `train_distribution` is computed from
-  `y_train`, before the split and before augmentation, so it cannot detect
-  augmentation at all.
-- Replaced the note with a **"Known facts"** section recording three verified
-  items: augmentation is active (S x7, V x3, to be removed later because it
-  violates hard constraint 2 and copies RR features unchanged across
-  duplicates); record 114 has leads `['V5','MLII']` so `LEAD_INDEX = 0` reads
-  V5 (to be fixed later); records 201 and 202 are the same subject, 201 in
-  DS1 and 202 in DS2, which must be disclosed as a limitation and never
-  "fixed" by editing the lists, and 201 must never go in the validation set.
-
-### Task B - step 1, patient-wise validation split
-
-- Added `DS1_VAL = ['207', '220', '223']` in section 3, plus
-  `DS1_TRAIN = [rec for rec in DS1 if rec not in DS1_VAL]` - computed from
-  DS1, not hardcoded, so it can never drift out of sync with the list.
-- Added three assertions next to it guarding the hard constraint: `DS1_VAL`
-  is a subset of DS1, shares nothing with DS2, and partitions DS1 exactly.
-- Section 12 now makes **three** `load_dataset` calls - `DS1_TRAIN`,
-  `DS1_VAL`, `DS2` - in the same style as the existing DS1/DS2 calls.
-- Sections 14, 15 and 16 gained the matching validation lines
-  (`y_valid_encoded`, `normalize_rr(RR_valid)`, `expand_dims(X_valid)`).
-- Section 17 no longer splits anything. The split happens at load time by
-  record, so the section just binds the downstream names.
-- **Deleted** the `train_test_split` call, `test_size=0.1`, and the
-  `from sklearn.model_selection import train_test_split` import, which is now
-  unused. `sklearn.metrics` and `sklearn.preprocessing` imports are untouched.
-- Every downstream name is preserved exactly: `X_tr`, `RR_tr`, `y_tr`,
-  `X_val`, `RR_val`, `y_val`. Nothing after section 17 needed changing.
-- Section 12 now prints the record lists and the class distribution of both
-  `DS1_TRAIN` and `DS1_VAL`; section 17 prints the two beat counts.
-- Added `"ds1_train": DS1_TRAIN` and `"ds1_val": DS1_VAL` to the `config`
-  block written into `metrics.json`.
-
-**Why 207 / 220 / 223.** They are the three records with the most S beats
-(106, 94, 73) after 209, 201 and 118. Together they give the validation set
-**273 S beats, a 4.20% S share** against DS1's overall 1.9% - dense enough for
-val S-F1 to be a usable selection signal, which was the whole point of running
-`tools/inspect_ds1.py` first. They are 12.8% of DS1 beats, close to the 10%
-the old `test_size=0.1` took. **201 was deliberately excluded** despite having
-128 S beats, because it is the same subject as DS2's record 202.
+Nothing else changed: no model, loss, hyperparameter, augmentation, or split
+change. `DS1_VAL` is still `['207','220','223']`.
 
 ---
 
 ## Files touched
 
-- `CLAUDE.md` - Landmine section replaced with Known facts
-- `src/train.py` - sections 3, 12, 14, 15, 16, 17, and the metrics config
-  block; one import removed
+- `src/train.py` - section 6 (normalization functions), section 15, and the
+  metrics config block
 - `docs/last_report.md` - this file
 
-`docs/ablation.md` was **not** touched. Step 1 has not been trained yet, so
-there is no `results/<run>/metrics.json` to source a row from, and inventing
-one would break the "every number must trace to a metrics.json" rule. The row
-gets added when the Kaggle run comes back.
+`docs/ablation.md` was **not** touched: see Problems item 3.
 
 ---
 
@@ -88,162 +56,210 @@ $ echo $?
 
 Passed, exit code 0.
 
-**Constants that must still be present**
+**No changed line falls inside a protected function** (AST line-span method,
+applied to both sides of the diff - 42 added lines, 9 deleted lines):
 
-| constant | occurrences | status |
-|---|---|---|
-| `alpha=0.50` | 2 | present |
-| `gamma=2.0` | 2 | present |
-| `learning_rate=1e-4` | 1 | present |
-| `multiplier = 6` | 1 | present |
-| `PRE_SAMPLES = 90` | 1 | present |
-| `POST_SAMPLES = 144` | 1 | present |
-
-(`alpha` and `gamma` appear twice each - once in the loss call, once in the
-metrics config block. That was already true before this change.)
-
-**`test_size=0.1` must be GONE**
-
-```
-$ grep -n "test_size" src/train.py
-(no output)
-```
-
-Confirmed absent. `grep -n train_test_split` returns exactly one line - line
-691, inside the explanatory comment in section 17. The import and the call are
-both gone.
-
-**DS1 and DS2 byte-identical**
-
-Extracted both list literals from the pre-edit and post-edit files and
-compared:
-
-```
-DS1 IDENTICAL   sha256 9f20e3ac1758a312...
-DS2 IDENTICAL   sha256 b8a3e6bbdeeec72a...
-```
-
-**No changed line touches a protected function**
-
-Parsed the AST to get each protected function's line span, then mapped every
-added line (new side) and every deleted line (old side) of the diff onto those
-spans:
-
-| function | lines | added-side | deleted-side |
+| function | lines (new) | added-side | deleted-side |
 |---|---|---|---|
-| `extract_beats_from_record` | 258-330 | CLEAN | CLEAN |
-| `augment_segment` | 386-428 | CLEAN | CLEAN |
-| `augment_training_data` | 435-511 | CLEAN | CLEAN |
-| `categorical_focal_loss` | 518-552 | CLEAN | CLEAN |
-| `build_model` | 742-887 | CLEAN | CLEAN |
+| `build_model` | 771-916 | CLEAN | CLEAN |
+| `categorical_focal_loss` | 536-570 | CLEAN | CLEAN |
+| `augment_segment` | 404-446 | CLEAN | CLEAN |
+| `augment_training_data` | 453-529 | CLEAN | CLEAN |
+| `extract_beats_from_record` | 276-348 | CLEAN | CLEAN |
 
-66 added lines and 24 deleted lines, none of them inside any of the five.
+Additionally `normalize_segment` was compared by `ast.dump` against the
+pre-edit file: **identical**. It sits next to the function I replaced and
+feeds two protected functions, so eyeballing it was not good enough.
 
-**Split logic dry-run** (executed standalone, no TensorFlow needed - the
-record lists were extracted from the edited file and the beat counts came from
-`tools/ds1_beat_counts.json`):
+**Constants unchanged**
+
+| constant | occurrences |
+|---|---|
+| `alpha=0.50` | 2 |
+| `gamma=2.0` | 2 |
+| `learning_rate=1e-4` | 1 |
+| `multiplier = 6` | 1 |
+| `PRE_SAMPLES = 90` | 1 |
+| `POST_SAMPLES = 144` | 1 |
+
+**Record literals unchanged** (extracted and hashed against the pre-edit file)
 
 ```
-asserts pass
-DS1_TRAIN (19): ['101','106','108','109','112','114','115','116','118','119',
-                 '122','124','201','203','205','208','209','215','230']
-DS1_VAL   (3): ['207', '220', '223']
-201 in val? False  (must be False)
+DS1      IDENTICAL  sha256 9f20e3ac1758a312...
+DS2      IDENTICAL  sha256 b8a3e6bbdeeec72a...
+DS1_VAL  IDENTICAL  sha256 0d9df3612a6111a1...
 
-predicted train dist: {'N': 40301, 'S': 670, 'V': 3105}  total 44076
-predicted val   dist: {'N': 5538,  'S': 273, 'V': 683}   total 6494
-val S share: 4.20%   val is 12.8% of DS1 beats
+DS1_TRAIN = [rec for rec in DS1 if rec not in DS1_VAL]
 ```
 
-No record appears on both sides, and the two sets partition DS1 exactly.
+The DS1 and DS2 hashes are the same values recorded in the step 1 report, so
+the lists are unchanged across both steps.
 
-**Falsifiable prediction for the Kaggle run.** Post-augmentation the training
-set should be 40301 + 670x7 + 3105x3 = **54,306 samples = 425 steps/epoch** at
-batch 128. The baseline ran 449. If the next run does not print 425
-steps/epoch, something in this change did not do what I think it did.
+**Numerical test on the real data.** `fit_rr_norm` and `apply_rr_norm` were
+lifted out of the edited `src/train.py` by AST (so the test exercises the
+shipped code, not a copy), and run against RR features extracted from the
+actual MIT-BIH records with the same beat-selection rule as
+`extract_beats_from_record`. No TensorFlow needed.
 
-**Augmentation still training-only**
+```
+lifted: ['apply_rr_norm', 'fit_rr_norm']
+extracting RR features ...
+shapes: (44076, 2) (6494, 2) (49289, 2)
 
-Section 18 consumes `X_tr / RR_tr / y_tr`, which are now DS1_TRAIN alone.
-`model.fit` receives `[X_tr_aug, RR_tr_aug]` for training and
-`validation_data=([X_val, RR_val], y_val_cat)` - the held-out records,
-un-augmented. Unchanged behaviour, correct data.
+OLD (step 1) - each set fitted on itself, scalar stats:
+  train mean/std:  275.015   76.299
+  val   mean/std:  289.605   60.672   <- different scale
+  test  mean/std:  282.492   87.781   <- different scale
+  val mean is 5.3% off train; val std is -20.5% off train
 
-**Variable reachability**
+NEW (step 1b) - fitted once on DS1_TRAIN, per column:
+  mean: [274.881103515625, 275.1480712890625]
+  std : [77.20227813720703, 75.38490295410156]
 
-Traced every name introduced or rebound; each is assigned before first use:
-`X_valid` (571 -> 590, 672, 700), `y_valid` (571 -> 599, 645), `RR_valid`
-(571 -> 659, 701), `y_valid_encoded` (643 -> 702), `X_val`/`RR_val`
-(700/701 -> 929), `y_val` (702 -> 704, 728). `SEED` is still referenced in six
-places, so dropping `random_state=SEED` left nothing dangling.
+  after applying TRAIN stats to all three:
+    train col means [-0.0, -0.0]  col stds [1.0, 1.0]
+    val   col means [0.1890999972820282, 0.19339999556541443]  col stds [0.7914000153541565, 0.7990999817848206]
+    test  col means [0.10970000177621841, 0.08609999716281891]  col stds [1.1380000114440918, 1.1634000539779663]
+  same-transform check: PASS
+
+zero-variance guard: std -> [1.0, 1.0] output all zeros & finite: True -> PASS
+mixed constant/varying columns: finite: True  varying col std -> 1.0 -> PASS
+
+per-column vs scalar - the reason axis=0 matters:
+  col means (raw train): [274.8810119628906, 275.14801025390625]
+  col stds  (raw train): [77.2020034790039, 75.38500213623047]
+  scalar mean/std over both cols: 275.015 76.299
+
+OVERALL: PASS
+```
+
+**This confirms the diagnosis.** Under the step 1 behaviour the validation
+set was scaled by its own std of **60.672** against training's **76.299** -
+**20.5% smaller**. Every validation RR feature was therefore inflated by
+roughly 1.26x relative to the scale the model was trained on, which is a
+feature distribution mismatch, exactly as you called it. After the fix,
+validation sits at mean +0.19 and std 0.79 *on the training scale* - a real,
+modest patient-to-patient difference rather than a fabricated rescaling.
 
 ---
 
-## git diff - section 17
+## Falsifiable predictions for the next Kaggle run
+
+1. **Steps/epoch must stay at 425.** Nothing about the split, the record
+   lists, or the augmentation changed, so the training set is still
+   40301 N + 670x7 S + 3105x3 V = 54,306 samples = 425 steps/epoch at batch
+   128. **If steps/epoch is not 425, this change did something it should not
+   have.**
+2. **The run must print exactly**
+   `mean (prev_rr, next_rr): [274.881103515625, 275.1480712890625]` and
+   `std  (prev_rr, next_rr): [77.20227813720703, 75.38490295410156]`.
+   I computed these locally from the same records the script will load. Any
+   deviation means Kaggle is reading different data than this machine.
+3. **val_accuracy should now clear 0.8528**, the all-N rate on this
+   validation set (5538 N of 6494 beats). Step 1 peaked at 0.7368, i.e. below
+   trivial. If it stays below 0.8528, the scale mismatch was not the whole
+   story and the next suspect is the record 114 lead swap.
+
+Prediction 3 is the real test of the hypothesis. Predictions 1 and 2 are
+guards that the change was surgical.
+
+---
+
+## git diff
 
 ```diff
-@@ -641,29 +681,27 @@ X_test = np.expand_dims(
+diff --git a/src/train.py b/src/train.py
+index 82a5d22..25ac4df 100644
+--- a/src/train.py
++++ b/src/train.py
+@@ -238,15 +238,33 @@ def normalize_segment(segment):
+     return (segment - mean) / std
+ 
+ 
+-def normalize_rr(rr_array):
++def fit_rr_norm(rr_array):
++    """Fit per-column RR statistics on the TRAINING set only.
++
++    RR is [prev_rr, next_rr], so the statistics are per column (axis=0),
++    not one scalar over both columns as before. Returns (mean, std), each
++    shape (2,). A zero-variance column gets std 1.0 so it is only centred,
++    never divided by zero.
++    """
+ 
+     rr_array = np.array(rr_array, dtype=np.float32)
+ 
+-    mean = np.mean(rr_array)
+-    std = np.std(rr_array)
++    mean = np.mean(rr_array, axis=0)
++    std = np.std(rr_array, axis=0)
+ 
+-    if std == 0:
+-        return rr_array - mean
++    std = np.where(std == 0.0, 1.0, std)
++
++    return mean.astype(np.float32), std.astype(np.float32)
++
++
++def apply_rr_norm(rr_array, mean, std):
++    """Apply already-fitted RR statistics.
++
++    Never fits. Validation and test are scaled with the training set's
++    mean and std so all three land on the same scale.
++    """
++
++    rr_array = np.array(rr_array, dtype=np.float32)
+ 
+     return (rr_array - mean) / std
+ 
+@@ -655,9 +673,20 @@ y_test_encoded = np.array([
+ # 15. NORMALIZE RR
+ # =========================================================
+ 
+-RR_train = normalize_rr(RR_train)
+-RR_valid = normalize_rr(RR_valid)
+-RR_test = normalize_rr(RR_test)
++# Fitted on DS1_TRAIN only. Fitting on validation or test would leak
++# their distribution into the pipeline; fitting each set separately (the
++# step 1 behaviour) put the three on three different scales, which is why
++# step 1 val_accuracy peaked at 0.7368, below the 0.8528 an all-N
++# prediction scores on that validation set.
++RR_NORM_MEAN, RR_NORM_STD = fit_rr_norm(RR_train)
++
++print("\nRR normalization fitted on DS1_TRAIN only:")
++print(f"  mean (prev_rr, next_rr): {RR_NORM_MEAN.tolist()}")
++print(f"  std  (prev_rr, next_rr): {RR_NORM_STD.tolist()}")
++
++RR_train = apply_rr_norm(RR_train, RR_NORM_MEAN, RR_NORM_STD)
++RR_valid = apply_rr_norm(RR_valid, RR_NORM_MEAN, RR_NORM_STD)
++RR_test = apply_rr_norm(RR_test, RR_NORM_MEAN, RR_NORM_STD)
  
  
  # =========================================================
--# 17. TRAIN / VALIDATION SPLIT
-+# 17. TRAIN / VALIDATION SPLIT (patient-wise)
- # =========================================================
+@@ -1247,7 +1276,11 @@ metrics = {
  
--(
--    X_tr,
--    X_val,
--    RR_tr,
--    RR_val,
--    y_tr,
--    y_val
--
--) = train_test_split(
--
--    X_train,
--    RR_train,
--    y_train_encoded,
-+# The split already happened at load time, by record: DS1_TRAIN and
-+# DS1_VAL were read as two separate datasets, so there is nothing to
-+# slice here and no beat from a validation patient can reach training.
-+#
-+# This previously used a stratified beat-level train_test_split over all
-+# of DS1, which put the same patient on both sides. Validation accuracy
-+# reached 0.9885 against a true DS2 accuracy of 0.9294, and EarlyStopping
-+# with restore_best_weights selected the final model on that leaked score.
+         "ds1_train": DS1_TRAIN,
  
--    test_size=0.1,
-+X_tr = X_train
-+RR_tr = RR_train
-+y_tr = y_train_encoded
+-        "ds1_val": DS1_VAL
++        "ds1_val": DS1_VAL,
++
++        "rr_norm_mean": RR_NORM_MEAN.tolist(),
++
++        "rr_norm_std": RR_NORM_STD.tolist()
+     },
  
--    random_state=SEED,
-+X_val = X_valid
-+RR_val = RR_valid
-+y_val = y_valid_encoded
- 
--    stratify=y_train_encoded
--)
-+print(f"\nTrain beats: {len(y_tr)}   Validation beats: {len(y_val)}")
- 
- 
- # =========================================================
+     "train_distribution": {
 ```
 
 ---
 
 ## Commit
 
-Two commits, so that the step 1 hash is the code change alone and can be cited
-cleanly in `docs/ablation.md` later:
-
 ```
-403c0ab  docs: correct CLAUDE.md - augmentation is active, not dead code
-ae9a91c  step 1: patient-wise validation split (DS1_VAL = 207,220,223)
+10e06f2  step 1b: fit RR normalization on training set only
 ```
 
-Both pushed to `origin/main`; `git status -sb` reports `## main...origin/main`
-with no divergence. This report lands in a small follow-up commit, as before.
+Pushed to `origin/main`; `git status -sb` reports `## main...origin/main` with
+no divergence. This report lands in a small follow-up commit, as before.
 
 ---
 
@@ -275,39 +291,37 @@ with no divergence. This report lands in a small follow-up commit, as before.
 
 ## Problems
 
-1. **RR normalisation statistics changed as an unavoidable consequence of
-   splitting at load time.** `normalize_rr()` computes mean and std from
-   whatever array it is handed. Before, `RR_train` was all of DS1, so training
-   and validation RR were scaled by shared DS1 statistics. Now `DS1_TRAIN` and
-   `DS1_VAL` are separate arrays and each is normalised by its own statistics.
-   I chose this deliberately: it is exactly the convention the script already
-   uses for DS1 versus DS2, and it keeps `normalize_rr()` untouched. The
-   alternative - normalising validation with training statistics - is arguably
-   more correct, but it would have meant changing section 6 or threading stats
-   through, which is beyond "change nothing else". **Flagging it because it is
-   a real semantic change that the instructions did not explicitly authorise.**
-   Worth its own step later if you want validation scaled by training stats.
+1. **The per-column change barely moves the numbers here, and I want that on
+   the record rather than overclaimed.** The two RR columns turn out to have
+   nearly identical statistics (mean 274.88 vs 275.15, std 77.20 vs 75.38,
+   against the old scalar 275.02 / 76.30). `axis=0` is the correct thing to
+   do and it is now correct, but on this dataset it is a rounding-level
+   difference. **The fix that matters is fitting on training only** - that is
+   what removes the 20.5% scale mismatch. If step 1b improves val_accuracy,
+   credit the train-only fit, not the per-column split.
 
-2. **`train_distribution` in `metrics.json` now means DS1_TRAIN, not DS1.**
-   It is still `Counter(y_train)`, but `y_train` is now the 19 training
-   records rather than all 22. Expect **N=40301 / S=670 / V=3105** in the next
-   run instead of the baseline's 45839 / 943 / 3788. That is the honest
-   number - it is what the model trains on - but the field is not comparable
-   across the baseline and step 1, so do not read a drop there as data loss.
-   There is no `val_distribution` field; adding one was not in scope, and it
-   is recoverable from `ds1_val` plus `tools/ds1_beat_counts.json`.
+2. **Test data is now scaled by training statistics, which is a change to how
+   DS2 is processed** - previously DS2 was normalized by its own statistics.
+   This is strictly more correct and is *required* by the no-tuning-against-
+   DS2 rule (fitting a scaler on DS2 is fitting a parameter on the test set),
+   but it does mean baseline and step 1 test numbers were produced under a
+   different preprocessing than step 1b's will be. Worth one sentence in the
+   paper's methods section.
 
-3. **The step 1 numbers are not comparable to the baseline on validation.**
-   Baseline val accuracy of 0.9885 was measured on a leaked split. Step 1 val
-   accuracy will look much worse, and that is the fix working, not a
-   regression. Only the DS2 test numbers are comparable between the two runs.
+3. **There is still no `metrics.json` for step 1 or step 1b in `results/`.**
+   The step 1 run happened - you quoted val_accuracy 0.7368 over 8 epochs -
+   but its metrics never came back into the repo, so `docs/ablation.md` still
+   holds only the baseline row. Under the "every number must trace to a
+   `results/<run>/metrics.json`" rule I did not add rows for either step. Drop
+   `results/step1/metrics.json` and `results/step1b/metrics.json` in and I
+   will fill both rows.
 
-4. **Augmentation is still active** (S x7, V x3), exactly as instructed for
-   this step. It still violates hard constraint 2 and still copies RR features
-   unchanged across every duplicate. Now recorded in CLAUDE.md under Known
-   facts and queued for a later step.
+4. **Record 114's lead swap is still unfixed** and is the leading remaining
+   suspect if prediction 3 fails. It is in DS1_TRAIN, so it is currently
+   feeding V5 into a model that sees MLII from the other 18 training records.
+   Already logged in CLAUDE.md under Known facts.
 
-5. Carried over from the previous task, unchanged: `tools/inspect_ds1.py`
-   writes its JSON into `tools/` rather than `docs/`, and a stale root
-   `__pycache__/` from before the reorganisation is still present. Both
-   harmless, both untouched.
+5. Carried over, unchanged: augmentation is still active (S x7, V x3, still
+   violating hard constraint 2, still queued for removal);
+   `tools/inspect_ds1.py` still writes its JSON into `tools/`; the stale root
+   `__pycache__/` is still there.
