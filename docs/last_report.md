@@ -1,78 +1,91 @@
 # Last report
 
-**Task:** step 4 - remove duplicate oversampling, replace the scalar focal
-alpha with a per-class vector. Also: added the step 3 run to
-`docs/ablation.md`.
+**Task:** step 5 - enlarge DS1_VAL to 5 records. Also: correct CLAUDE.md
+(augmentation was removed at step 4), record the DS1_VAL change in both
+CLAUDE.md and `docs/ablation.md`.
 
 **Date:** 2026-08-22
 
 ---
 
-## What changed
+## Blocking problem: there is no step 4 run
 
-**Oversampling removed.** Section 18 no longer calls
-`augment_training_data()`. It assigns the training arrays straight through:
-
-```python
-X_tr_aug = X_tr
-RR_tr_aug = RR_tr
-y_tr_aug = y_tr
-```
-
-The `*_aug` names are kept so nothing downstream changes. Both
-`augment_training_data()` and `augment_segment()` remain defined but are
-**unreachable**, and their section headers are now marked
-`[DEPRECATED - unused since step 4]` with a comment saying not to re-enable
-them.
-
-**Focal alpha is now per-class.** `categorical_focal_loss(alpha, gamma=2.0)`
-takes a length-3 vector, converted once to a `tf.constant` and broadcast over
-the class axis of `y_pred` (batch, 3). `alpha` is now a **required** argument
-with no default - the old signature defaulted to the scalar `0.50`, and I did
-not want that silently reachable again.
-
-Derived at runtime in section 12 from DS1_TRAIN counts only:
+`results/step4_class_alpha/metrics.json` is **byte-identical** to
+`results/step3_rr_ratios/metrics.json`:
 
 ```
-alpha_c = (1 / count_c) ** FOCAL_BETA,  rescaled so sum(alpha) == NUM_CLASSES
+metrics.json   step3 sha256 f6e91c1dcaf43d0b...   step4 sha256 f6e91c1dcaf43d0b...   identical True
+history.json   step3 sha256 3da5fb67e3e916b4...   step4 sha256 3da5fb67e3e916b4...   identical True
 ```
 
-**Constants hoisted** into section 3: `FOCAL_BETA = 0.5`,
-`FOCAL_GAMMA = 2.0`, `ADAM_LEARNING_RATE = 1e-4`. The learning-rate *value* is
-unchanged - only the literal moved.
+Both files carry `run_name: step3_rr_ratios`, timestamp
+`2026-08-22T16:14:13.768739`, scalar `focal_loss_alpha: 0.5`, and **no**
+`oversampling`, `focal_loss_beta` or `focal_alpha_class_counts` keys - all of
+which step 4's code writes. Its `history.json` peaks at val macro-F1 0.5618 at
+epoch 8, which is step 3's curve, not the 0.7288-at-epoch-3 curve you
+described. It is a copy of the step 3 run placed in a step 4 folder.
 
-**metrics.json config** now carries `focal_loss_alpha` (the computed vector),
-`focal_loss_beta`, `focal_loss_gamma`, `focal_alpha_class_counts`,
-`oversampling: false`, and `adam_learning_rate`, so a run's loss configuration
-is fully recoverable from its own metrics file.
+**I did not fill the step 4 ablation row from it.** Reading it
+programmatically, as instructed, would have written step 3's numbers under
+step 4's name and commit hash - the exact failure the "every number must trace
+to a `results/<run>/metrics.json`" rule exists to prevent. The row is present
+but marked `pending`, with a note recording the sha256 collision and your
+verbally-reported figures (val 0.7288 -> 0.5791, plateau 0.5661, test 0.5599)
+as provenance, explicitly flagged as not yet traceable.
 
-The alpha vector and the per-class counts are printed at load time; section 18
-prints the training size and distribution.
+**I also did not commit `results/step4_class_alpha/`** - it is left untracked
+rather than enshrining a mislabelled artefact in the results tree. Drop the
+real `metrics.json` in and I will fill the row and commit it.
 
-Nothing else changed: no architecture change, no learning-rate value change,
-no RR feature change, no split change. `DS1_VAL` is still
-`['207','220','223']`.
+Everything else in the task is complete.
 
 ---
 
-## Step 3 predictions - scorecard
+## What changed
 
-| # | prediction | outcome |
-|---|---|---|
-| 1 | `rr_feature_names` in order; `rr_norm_mean` a 5-list near 1.0 | **PASS** - names exact; mean `[1.0009, 1.0027, 0.9925, 1.0124, 1.0461]`, identical to my local computation |
-| 2 | printed clip table under 1% at either bound | **PASS by construction, not directly observed** - the console print is not captured in the artefacts; `rr_clip` is `[0.2, 3.0]` in config and the same data locally gives 0.1348% of cells. I am marking this as not independently verified from the run output. |
-| 3 | test S recall exceeds 0.1280 | **PASS** - 0.1514 |
+**`DS1_VAL` grew from 3 records to 5:**
 
-**But macro-F1 regressed 0.6800 -> 0.6645**, and that matters more than
-prediction 3 passing. What actually happened: the S->N leak nearly halved
-(1350 -> 692 of 1836), which is what the ratio features were supposed to do -
-but the freed beats went to **V**, not to S (S->V 251 -> 866). V F1 fell
-0.8718 -> 0.8004. The features carry real prematurity signal; the model is
-spending it on the wrong boundary. That is a class-balancing symptom, which
-is exactly what this step addresses.
+```python
+DS1_VAL = ['106', '118', '207', '220', '223']
+```
 
-**Your stated condition is recorded in `docs/ablation.md`:** if step 4 does
-not recover macro-F1 above 0.6800, the ratio features get reconsidered.
+`DS1_TRAIN` is unchanged in form - still
+`[rec for rec in DS1 if rec not in DS1_VAL]`, computed rather than hardcoded -
+and now resolves to 17 records.
+
+**The selection rule is recorded in code and written to `metrics.json` under
+`val_selection_rule`**, as a structured object rather than prose, so it is
+auditable and cannot be quietly re-derived:
+
+- **keep** `207, 220, 223` - the original step 1 set, so the signal stays as
+  comparable as possible
+- **exclude 209** - holds 383 of the 943 DS1 S beats; moving it to validation
+  would starve training of S
+- **exclude 201** - same subject as test record 202
+- **add 118** - most S beats of the remaining candidates (96)
+- **add 106** - most V beats among records with <= 5 S beats (520), which
+  fixes validation V-F1 resting on only two records
+
+**CLAUDE.md corrected.** The "Known facts" augmentation entry said
+augmentation is active and "will be removed in a later step" - that step was
+step 4. It now records that augmentation is **removed**, that both functions
+are dead code with zero call sites, that class balancing happens in the loss
+via `FOCAL_ALPHA`, and - kept as history - that baseline through step 3 were
+produced *with* augmentation so their numbers are read correctly. Added a note
+that `config.oversampling` or the steps/epoch count is how to check, since
+`train_distribution` structurally cannot reveal it.
+
+A new "Known facts" entry records the DS1_VAL change and its comparability
+consequence. The stale "Current state" block (baseline-only) now points at
+`docs/ablation.md` and carries the step 2 / step 3 rows, and the "Blocking
+problem" paragraph is updated: the failure is no longer purely S->N, since
+step 3 moved those beats to V.
+
+**`docs/ablation.md`** gains a blockquote at the top recording the validation
+change and that baseline..step 4 are not like-for-like with step 5 onward.
+
+Nothing else changed: no architecture, loss, alpha, beta, learning-rate, RR
+feature, or augmentation change.
 
 ---
 
@@ -83,178 +96,128 @@ not recover macro-F1 above 0.6800, the ratio features get reconsidered.
 **`ast.dump` comparison - exactly which functions changed:**
 
 ```
-changed  : ['build_model', 'categorical_focal_loss']
+changed  : NONE
 added    : NONE
 removed  : NONE
-unchanged: 10 of 12
+unchanged: 12 of 12
+classes changed: NONE
 ```
 
-Both changes were expected; there are no others. `build_model` changed **only**
-in its `model.compile()` call - `model.compile` lives inside `build_model`, so
-the loss and optimiser edits necessarily land there. The complete diff of that
-function is four lines:
+Step 5 touches module-level constants only, so **zero functions changed** -
+which is what a pure split change should look like.
 
-```diff
--            learning_rate=1e-4
-+            learning_rate=ADAM_LEARNING_RATE
--            alpha=0.50,
--            gamma=2.0
-+            alpha=FOCAL_ALPHA,
-+            gamma=FOCAL_GAMMA
-```
+**Constants unchanged** (count identical before and after, one occurrence
+each): `PRE_SAMPLES = 90`, `POST_SAMPLES = 144`, `FOCAL_BETA = 0.5`,
+`FOCAL_GAMMA = 2.0`, `ADAM_LEARNING_RATE = 1e-4`, `RR_LOCAL_WINDOW = 10`,
+`RR_CLIP_MIN = 0.2`, `RR_CLIP_MAX = 3.0`.
 
-`Dense(16)` in the RR branch is still present. No layer, unit count, kernel
-size, dropout rate or activation changed.
+**The 5 RR feature definitions**: the `rr = [...]` source block and
+`RR_FEATURE_NAMES` are both byte-identical to the pre-edit file.
 
-**Is `augment_training_data` actually dead?** Checked by AST call-graph, not
-grep - grep is what got this wrong once before. Every `ast.Call` node in the
-file was collected and attributed to the function containing it:
+**Record literals**: `DS1` and `DS2` identical (sha256 `9f20e3ac1758a312...`
+and `b8a3e6bbdeeec72a...`, the same hashes as steps 1 through 4). `DS1_VAL`
+changed, as intended.
 
-```
-augment_training_data        called from: NOWHERE
-augment_segment              called from: ['augment_training_data']
-extract_beats_from_record    called from: ['load_dataset']
-load_dataset                 called from: ['<module>']
-categorical_focal_loss       called from: ['build_model']
-build_model                  called from: ['<module>']
-fit_rr_norm                  called from: ['<module>']
-apply_rr_norm                called from: ['<module>']
-```
+**`augment_training_data` still dead** - AST call-graph reports zero call
+sites, unchanged by this step.
 
-`augment_training_data` has zero call sites, and `augment_segment` is
-reachable only through it, so both are dead. The three `*_tr_aug` names are
-still assigned at module level, so the model still receives data.
-
-**Constants and definitions unchanged:** `PRE_SAMPLES = 90` (1),
-`POST_SAMPLES = 144` (1), `ADAM_LEARNING_RATE = 1e-4` present, the literal
-`alpha=0.50` gone. The five RR feature definitions were compared as a source
-block against the pre-edit file: **identical**, as are `RR_FEATURE_NAMES`,
-`RR_LOCAL_WINDOW = 10`, `RR_CLIP_MIN = 0.2`, `RR_CLIP_MAX = 3.0`.
-
-**Record literals unchanged:**
+**Split and counts:**
 
 ```
-DS1      IDENTICAL  sha256 9f20e3ac1758a312...
-DS2      IDENTICAL  sha256 b8a3e6bbdeeec72a...
-DS1_VAL  IDENTICAL  sha256 0d9df3612a6111a1...
-```
+A) split membership
+   DS1_VAL   (5): ['106', '118', '207', '220', '223']
+   DS1_TRAIN (17): ['101', '108', '109', '112', '114', '115', '116', '119', '122', '124', '201', '203', '205', '208', '209', '215', '230']
+   [PASS] DS1_VAL has 5 records
+   [PASS] DS1_VAL == ['106','118','207','220','223']
+   [PASS] DS1_VAL subset of DS1
+   [PASS] DS1_VAL disjoint from DS2
+   [PASS] partitions DS1
+   [PASS] no overlap train/val
+   [PASS] 209 in DS1_TRAIN, NOT in DS1_VAL
+   [PASS] 201 in DS1_TRAIN, NOT in DS1_VAL
+   [PASS] 202 (same subject as 201) is in DS2, untouched
+   [PASS] DS1_TRAIN computed, not hardcoded
 
-Same hashes as steps 1 through 3.
+B) class counts from tools/ds1_beat_counts.json
+   set               N      S      V    total    S share
+   train         36631    574   2569    39774      1.44%
+   val            9208    369   1219    10796      3.42%
 
-**Numerical verification of the alpha computation.** The derivation block was
-extracted from the shipped source and executed against a label array built to
-the real DS1_TRAIN counts (taken from `tools/ds1_beat_counts.json`, not
-hardcoded), then compared against both your reference values and an
-independent recomputation of the formula.
+   validation grew: 6494 -> 10796 beats (12.8% -> 21.3% of DS1)
+   val S beats : 273 -> 369
+   val V beats : 683 -> 1219
+   records contributing V to val: 2 -> 4
+   records contributing S to val: 3 -> 4
 
-```
-A) AST call-graph check (not grep - grep missed this once)
-   augment_training_data        called from: NOWHERE
-   augment_segment              called from: ['augment_training_data']
-   extract_beats_from_record    called from: ['load_dataset']
-   load_dataset                 called from: ['<module>']
-   categorical_focal_loss       called from: ['build_model']
-   build_model                  called from: ['<module>']
-   fit_rr_norm                  called from: ['<module>']
-   apply_rr_norm                called from: ['<module>']
+   training shrank: 44076 -> 39774 beats (S 670 -> 574)
 
-   augment_training_data is dead: True -> PASS
-   augment_segment only reachable via the dead function: True -> PASS
-   *_tr_aug still assigned at module level: 3 -> PASS
+C) FOCAL_ALPHA recomputes automatically from the new counts
+   step 4 counts [40301, 670, 3105] -> alpha [0.2428, 1.8827, 0.8746]
+   step 5 counts [36631, 574, 2569] -> alpha [0.235, 1.8775, 0.8875]
+   alpha sums to 3: 3.000000
+   NOTE: alpha shifts because it is derived from DS1_TRAIN counts,
+         which changed. Max per-class shift: 0.0129
 
-B) alpha derivation, executed from the shipped source
-   extracted 22 lines of derivation code
-   DS1_TRAIN counts from tools/ds1_beat_counts.json: {'N': 40301, 'S': 670, 'V': 3105}
-   FOCAL_CLASS_COUNTS: [40301, 670, 3105]
-   FOCAL_ALPHA       : [0.2428, 1.8827, 0.8746]
-   sum               : 3.000000
-   [PASS] counts are N/S/V in class-index order
-   [PASS] length 3
-   [PASS] sums to NUM_CLASSES=3
-   [PASS] matches reference [0.2428, 1.8827, 0.8746] to 1e-3
-   [PASS] matches independent recomputation to 1e-6
-   [PASS] rarest class gets the largest weight
-   [PASS] most common class gets the smallest weight
-   [PASS] ordering follows inverse frequency (N < V < S)
+D) steps/epoch (no oversampling since step 4)
+   step 4: 44076 samples / 128 = 345 steps
+   step 5: 39774 samples / 128 = 311 steps
 
-C) what the change actually does to the loss
-   old: scalar alpha 0.50 applied to every class
-   new: [0.2428, 1.8827, 0.8746]
-
-   class     count  old alpha  new alpha ratio new/old
-   N         40301     0.5000     0.2428        0.486x
-   S           670     0.5000     1.8827        3.765x
-   V          3105     0.5000     0.8746        1.749x
-
-   total loss mass per class (count x copies x alpha):
-   class             old            new     change
-   N             20150.5         9783.1      0.49x
-   S              2345.0         1261.4      0.54x
-   V              4657.5         2715.5      0.58x
-
-   effective per-beat emphasis vs N (copies x alpha, normalised):
-   S:N   old 7.000x -> new 7.756x   (+10.8%)
-   V:N   old 3.000x -> new 3.603x   (+20.1%)
-
-   mean alpha per sample  old 0.5000 -> new 0.3122  (62% of old)
-   training samples  old (S x7, V x3): 54306 -> 425 steps/epoch @128
-   training samples  new (no oversample): 44076 -> 345 steps/epoch @128
-
+============================================================
+   [PASS] alpha still sums to NUM_CLASSES
+   [PASS] alpha ordering still N < V < S
 OVERALL: PASS
 ```
 
-`FOCAL_ALPHA = [0.2428, 1.8827, 0.8746]`, matching your reference to four
-decimals and an independent recomputation to 1e-6, summing to exactly 3.
+**209 and 201 are both in DS1_TRAIN and neither is in DS1_VAL** - checked
+explicitly, along with 202 still being in DS2.
 
 ---
 
-## The swap is close to weight-neutral - worth knowing before reading the result
+## What this costs and what it buys
 
-This is the part I would not have predicted, and it changes how step 4's
-outcome should be read.
-
-Old scheme: S got its emphasis from **duplication** (7 copies, each weighted
-0.50). New scheme: S gets it from **alpha** (1 copy, weighted 1.8827). Those
-nearly cancel:
-
-| | S:N emphasis | V:N emphasis |
+| | step 4 (3 records) | step 5 (5 records) |
 |---|---|---|
-| old (copies x alpha) | 7.000x | 3.000x |
-| new (copies x alpha) | 7.756x | 3.603x |
-| change | **+10.8%** | **+20.1%** |
+| validation beats | 6,494 (12.8% of DS1) | **10,796 (21.3%)** |
+| validation S beats | 273 | **369** |
+| validation V beats | 683 | **1,219** |
+| records contributing S | 3 | 4 |
+| records contributing V | **2** | **4** |
+| training beats | 44,076 | 39,774 |
+| training S beats | 670 | **574** |
+| steps/epoch @128 | 345 | **311** |
 
-So this step is **not** a large rebalancing toward S. It is mostly a
-*cleaner* rebalancing - the same relative emphasis, achieved without
-fabricating data or duplicating RR vectors.
+The cost is real: training loses 96 S beats, 14% of an already tiny class.
+The buy is that validation V-F1 no longer rests on two records, and the
+selection signal is computed over 66% more beats.
 
-What does change substantially is the **absolute gradient scale**:
-
-- mean alpha per sample: 0.5000 -> 0.3122 (**62% of before**)
-- samples per epoch: 54,306 -> 44,076 (**425 -> 345 steps/epoch**)
-
-Combined, an epoch now delivers roughly half the loss mass it used to. That
-behaves like a lower learning rate. If step 4 underperforms, "needs more
-epochs" is a live explanation before "the rebalancing failed" - check
-`best_epoch` and whether early stopping fired before concluding anything.
+**`FOCAL_ALPHA` shifts as an automatic consequence**, because it is derived
+from DS1_TRAIN counts: `[0.2428, 1.8827, 0.8746]` -> `[0.2350, 1.8775,
+0.8875]`, max per-class shift 0.0129. This is the code doing what it should,
+not a manual alpha edit - but it does mean step 5 is not a *pure* validation
+change. Flagging it because the task said change nothing else.
 
 ---
 
 ## Falsifiable predictions for the next Kaggle run
 
-1. **345 steps/epoch** (44,076 samples at batch 128), down from 425.
-   `config.oversampling` will be `false` and `train_distribution` will still
-   read N=40301 / S=670 / V=3105 - that field is computed before the split,
-   so it does not change.
-2. **`config.focal_loss_alpha` will be `[0.2428..., 1.8827..., 0.8746...]`**
-   summing to 3.0, with `focal_alpha_class_counts = [40301, 670, 3105]`.
-3. **S->V misclassification will fall from 866.** The V weight rose only 1.75x
-   against N's 0.49x, so V should stop absorbing S beats. This is the
-   mechanism the step targets.
-4. **macro-F1 will land above step 3's 0.6645.** Whether it clears step 2's
-   0.6800 - your stated condition - I genuinely do not know: the relative
-   rebalancing is only +10.8% for S, so a large jump would surprise me.
+1. **311 steps/epoch** (39,774 samples at batch 128), down from 345.
+   `train_distribution` will read **N=36631 / S=574 / V=2569** and
+   `config.ds1_val` will list the five records.
+2. **`config.focal_loss_alpha` will be approximately
+   `[0.2350, 1.8775, 0.8875]`**, summing to 3.0, with
+   `focal_alpha_class_counts = [36631, 574, 2569]`.
+3. **The epoch-to-epoch swing in val macro-F1 will be smaller than step 4's
+   0.1497.** This is the actual bet - the whole point of the change. I expect
+   the largest single-epoch swing to come in under 0.10.
+4. **`val_per_record` will show non-zero V support for four of the five
+   records** (all but 220), so validation V-F1 stops depending on two
+   patients.
 
-Prediction 3 is the mechanistic test. Prediction 4 is the decision gate.
+Prediction 3 is the one that decides whether this step worked. Note it is a
+statement about *validation stability*, not about test macro-F1 - a
+lower-variance selector should produce a more trustworthy checkpoint, but
+with 14% fewer S training beats the test score could legitimately go either
+way.
 
 ---
 
@@ -262,194 +225,75 @@ Prediction 3 is the mechanistic test. Prediction 4 is the decision gate.
 
 ```diff
 diff --git a/src/train.py b/src/train.py
-index 8296cc6..92ad64c 100644
+index 92ad64c..238373a 100644
 --- a/src/train.py
 +++ b/src/train.py
-@@ -199,6 +199,17 @@ RR_LOCAL_WINDOW = 10
- RR_CLIP_MIN = 0.2
- RR_CLIP_MAX = 3.0
+@@ -157,13 +157,50 @@ DS2 = [
+     '222', '228', '231', '232', '233', '234'
+ ]
  
-+# Loss settings (step 4).
-+# Focal alpha is a PER-CLASS vector, derived at runtime from the DS1_TRAIN
-+# counts as (1 / count_c) ** FOCAL_BETA, rescaled to sum to NUM_CLASSES.
-+# It was previously the scalar 0.50, which multiplies every class by the
-+# same factor and rebalances nothing - it just halved the effective loss.
-+FOCAL_BETA = 0.5
+-# Patient-wise validation split (step 1).
++# Patient-wise validation split (step 1, enlarged at step 5).
+ # Whole records are held out of training, never individual beats, so no
+-# patient can appear on both sides. 207 / 220 / 223 are chosen because
+-# they carry enough S beats (106 / 94 / 73) for val S-F1 to be a usable
+-# selection signal. Record 201 is deliberately NOT used here: it is the
+-# same subject as 202, which lives in DS2.
+-DS1_VAL = ['207', '220', '223']
++# patient can appear on both sides.
++#
++# Step 5 grew this from 3 records to 5. With 3 records, val macro-F1 swung
++# 0.7288 -> 0.5791 between two consecutive epochs, and the selected peak
++# sat 0.1627 above the surrounding plateau for exactly one epoch. That
++# checkpoint then scored 0.5599 on test - we were selecting noise. More
++# records means a lower-variance selection signal.
++DS1_VAL = ['106', '118', '207', '220', '223']
 +
-+FOCAL_GAMMA = 2.0
-+
-+ADAM_LEARNING_RATE = 1e-4
-+
- LEAD_INDEX = 0
- 
- BATCH_SIZE = 128
-@@ -462,9 +473,13 @@ def load_dataset(
- 
- 
- # =========================================================
--# 9. ECG AUGMENTATION
-+# 9. ECG AUGMENTATION  [DEPRECATED - unused since step 4]
- # =========================================================
- 
-+# DEPRECATED. Not called anywhere. Kept only so earlier runs in
-+# docs/ablation.md remain readable against this file. Do not re-enable:
-+# synthetic beats violate hard constraint 2 (no data expansion).
-+
- def augment_segment(segment):
- 
-     x = segment.copy()
-@@ -511,9 +526,14 @@ def augment_segment(segment):
- 
- 
- # =========================================================
--# 10. TARGETED AUGMENTATION
-+# 10. TARGETED AUGMENTATION  [DEPRECATED - unused since step 4]
- # =========================================================
- 
-+# DEPRECATED. augment_training_data() is no longer called; section 18
-+# passes the training arrays straight through. It expanded S x7 / V x3 with
-+# duplicated RR vectors, which violates hard constraint 2. Class balancing
-+# is done in the loss now (FOCAL_ALPHA). Do not re-enable.
-+
- def augment_training_data(
-     X,
-     RR,
-@@ -598,9 +618,24 @@ def augment_training_data(
- # =========================================================
- 
- def categorical_focal_loss(
--    alpha=0.50,
-+    alpha,
-     gamma=2.0
- ):
-+    """Multiclass focal loss with a PER-CLASS alpha vector.
-+
-+    alpha must be a sequence of length NUM_CLASSES. y_pred is
-+    (batch, n_classes), so a (n_classes,) alpha broadcasts over the class
-+    axis and each class gets its own weight.
-+
-+    alpha is deliberately required, not defaulted: the old signature
-+    defaulted to the scalar 0.50, which applied the same factor to all
-+    three classes and therefore performed no rebalancing at all.
-+    """
-+
-+    alpha = tf.constant(
-+        alpha,
-+        dtype=tf.float32
-+    )
- 
-     def loss(y_true, y_pred):
- 
-@@ -708,6 +743,38 @@ print("\nOriginal Test Distribution:")
- print(Counter(y_test))
- 
- 
-+# --- per-class focal alpha, derived from DS1_TRAIN counts only ----------
-+# Uses training counts only - no validation or test information.
-+
-+_train_counts = Counter(y_train)
-+
-+FOCAL_CLASS_COUNTS = [
-+    int(_train_counts[INT_TO_LABEL[_i]])
-+    for _i in range(NUM_CLASSES)
-+]
-+
-+_alpha_raw = np.array(
-+    [
-+        (1.0 / _count) ** FOCAL_BETA if _count > 0 else 0.0
-+        for _count in FOCAL_CLASS_COUNTS
++# Why these five, recorded so the choice is auditable and never quietly
++# re-derived. Written into metrics.json as val_selection_rule.
++VAL_SELECTION_RULE = {
++    "keep": {
++        "records": ['207', '220', '223'],
++        "reason": "the original step 1 validation set, kept so the "
++                  "selection signal stays comparable where possible"
++    },
++    "exclude": [
++        {
++            "record": "209",
++            "reason": "holds 383 of the 943 DS1 S beats; moving it to "
++                      "validation would starve training of S"
++        },
++        {
++            "record": "201",
++            "reason": "same subject as test record 202 (PhysioNet); "
++                      "validating on it would stack a second leak"
++        }
 +    ],
-+    dtype=np.float64
-+)
++    "add": [
++        {
++            "record": "118",
++            "reason": "most S beats of the remaining candidates (96)"
++        },
++        {
++            "record": "106",
++            "reason": "most V beats among records with <= 5 S beats "
++                      "(520); 220 has zero V, so validation V-F1 rested "
++                      "on only two records"
++        }
++    ]
++}
+ 
+ DS1_TRAIN = [rec for rec in DS1 if rec not in DS1_VAL]
+ 
+@@ -1673,6 +1710,8 @@ metrics = {
+ 
+         "ds1_val": DS1_VAL,
+ 
++        "val_selection_rule": VAL_SELECTION_RULE,
 +
-+FOCAL_ALPHA = (
-+    _alpha_raw * (NUM_CLASSES / _alpha_raw.sum())
-+).astype(np.float32)
-+
-+print(f"\nFocal alpha (per class, beta={FOCAL_BETA}, "
-+      f"rescaled to sum {NUM_CLASSES}):")
-+
-+for _i in range(NUM_CLASSES):
-+    print(f"  {INT_TO_LABEL[_i]}: count {FOCAL_CLASS_COUNTS[_i]:>6}  "
-+          f"alpha {FOCAL_ALPHA[_i]:.4f}")
-+
-+print(f"  vector: {FOCAL_ALPHA.tolist()}  (sum {FOCAL_ALPHA.sum():.4f})")
-+
-+
- # =========================================================
- # 13. CLASS DISTRIBUTION PLOT
- # =========================================================
-@@ -839,14 +906,27 @@ print(f"\nTrain beats: {len(y_tr)}   Validation beats: {len(y_val)}")
+         "rr_feature_names": RR_FEATURE_NAMES,
  
- 
- # =========================================================
--# 18. AUGMENT TRAINING DATA
-+# 18. AUGMENT TRAINING DATA (REMOVED - step 4)
- # =========================================================
- 
--X_tr_aug, RR_tr_aug, y_tr_aug = augment_training_data(
--    X_tr,
--    RR_tr,
--    y_tr
--)
-+# Duplicate oversampling is gone. It expanded S x7 and V x3 while copying
-+# the RR feature vector UNCHANGED across every copy, so six of every seven
-+# S training examples carried identical rhythm context - teaching the model
-+# to memorise specific training rhythms instead of the relative-timing
-+# rule the step 3 features encode. The np.roll time shift also moved the
-+# R-peak off its aligned position. It violated hard constraint 2.
-+#
-+# Class balancing now happens in the loss instead, via the per-class
-+# FOCAL_ALPHA vector derived in section 12.
-+#
-+# The *_aug names are kept so nothing downstream needs to change.
-+
-+X_tr_aug = X_tr
-+RR_tr_aug = RR_tr
-+y_tr_aug = y_tr
-+
-+print(f"\nTraining samples (no oversampling): {len(y_tr_aug)}")
-+print(f"Training distribution: {Counter(y_tr_aug)}")
- 
- 
- # =========================================================
-@@ -1007,12 +1087,12 @@ def build_model(ecg_shape, rr_shape):
-     model.compile(
- 
-         optimizer=tf.keras.optimizers.Adam(
--            learning_rate=1e-4
-+            learning_rate=ADAM_LEARNING_RATE
-         ),
- 
-         loss=categorical_focal_loss(
--            alpha=0.50,
--            gamma=2.0
-+            alpha=FOCAL_ALPHA,
-+            gamma=FOCAL_GAMMA
-         ),
- 
-         metrics=['accuracy']
-@@ -1573,11 +1653,17 @@ metrics = {
- 
-         "LEAD_INDEX": LEAD_INDEX,
- 
--        "focal_loss_alpha": 0.50,
-+        "focal_loss_alpha": FOCAL_ALPHA.tolist(),
-+
-+        "focal_loss_beta": FOCAL_BETA,
-+
-+        "focal_loss_gamma": FOCAL_GAMMA,
-+
-+        "focal_alpha_class_counts": FOCAL_CLASS_COUNTS,
- 
--        "focal_loss_gamma": 2.0,
-+        "oversampling": False,
- 
--        "adam_learning_rate": 1e-4,
-+        "adam_learning_rate": ADAM_LEARNING_RATE,
- 
-         "DS1": DS1,
- 
+         "rr_local_window": RR_LOCAL_WINDOW,
 ```
 
 ---
@@ -457,7 +301,7 @@ index 8296cc6..92ad64c 100644
 ## Commit
 
 ```
-3b67016  step 4: remove oversampling, per-class focal alpha
+7b0236d  step 5: enlarge DS1_VAL to 5 records
 ```
 
 Pushed to `origin/main`. This report lands in a small follow-up commit.
@@ -466,33 +310,31 @@ Pushed to `origin/main`. This report lands in a small follow-up commit.
 
 ## Problems
 
-1. **Hard constraint 2 is now satisfied, and CLAUDE.md is out of date.** The
-   "Known facts" entry still says augmentation is active and will be removed
-   "in a later step". That later step is this one. I have not edited CLAUDE.md
-   because you did not ask and it is not part of the commit's stated scope -
-   but it should be updated before the next task, or the next reader will act
-   on a stale fact. Say the word and I will fix it.
+1. **No step 4 metrics.json** - see the top of this report. The step 4 row is
+   `pending`, `results/step4_class_alpha/` is uncommitted, and step 4's
+   effect on the S->V leak (its whole purpose) is still unmeasured. This also
+   means the step 3 stated condition - "if step 4 does not recover macro-F1
+   above 0.6800, the ratio features get reconsidered" - **cannot yet be
+   evaluated**. Your verbal 0.5599 would fail that condition, but I am not
+   treating an unverified number as grounds for reconsidering the features.
 
-2. **The two augmentation functions are now genuinely dead code**, kept
-   deliberately at your instruction. Verified dead by call-graph, and marked
-   DEPRECATED in two places. Note this is the same shape of claim I got wrong
-   before, which is why it is AST-verified rather than grepped this time.
+2. **Step 5 is not perfectly single-variable.** Enlarging validation
+   necessarily shrinks training, which shifts `FOCAL_ALPHA` (max 0.0129) and
+   removes 96 S beats. Unavoidable given the fix, but it means a step 5 vs
+   step 4 delta mixes three things: selection variance, training-set size,
+   and a small alpha shift.
 
-3. **Effective gradient scale roughly halved** - see the section above. This
-   is a real confound in comparing step 4 against step 3, and it was not
-   flagged in the task. It is a consequence of doing the swap correctly, not
-   an error, but it means step 4 is not a perfectly clean single-variable
-   comparison either.
+3. **Training S beats are down to 574.** That is a thin class to learn from,
+   and it is the class the whole project is about. If step 5's test S recall
+   drops, the 14% reduction in S training data is a live explanation before
+   "the larger validation set selected a worse model".
 
-4. **Record 207 is still a severe validation outlier** - step 3 gave accuracy
-   0.1733, N recall 0.0824, S recall 0.0000, essentially unchanged from step
-   2's 0.1647 / 0.0700 / 0.0000. Patient-relative RR did not help it. 207 has
-   sustained ventricular flutter, so its median RR is itself computed over
-   abnormal rhythm - the ratio denominator is unreliable for exactly this
-   record. If step 4 does not move it, the validation set composition is worth
-   a deliberate decision (changing `DS1_VAL` would break comparability with
-   steps 1-4, so it is not a change to make casually).
+4. **Record 207 remains a severe outlier** (step 3: accuracy 0.1733, N recall
+   0.0824, S recall 0.0000) and it is still in DS1_VAL. Enlarging the set
+   dilutes its influence from 1/3 to 1/5 of the records, which helps, but it
+   does not fix it. If 207 continues to dominate, removing it is a separate
+   deliberate decision - and it would break comparability again.
 
-5. Carried over: record 114 lead swap still unfixed; `tools/inspect_ds1.py`
-   still writes its JSON into `tools/`; stale root `__pycache__/` still
-   present.
+5. Carried over: record 114 lead swap still unfixed;
+   `tools/inspect_ds1.py` still writes its JSON into `tools/`; stale root
+   `__pycache__/` still present.
