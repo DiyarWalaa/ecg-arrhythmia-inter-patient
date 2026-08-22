@@ -27,22 +27,30 @@ progress, so every reported number must be traceable and reproducible.
 
 Established, verified, and not to be re-litigated:
 
-1. **Augmentation IS active in the baseline.** `augment_training_data()`
-   (`src/train.py` section 18) is called on the training portion and expands
-   **S beats x7 and V beats x3** (the original beat plus 6 or 2 synthetic
-   copies). Proof: the Kaggle baseline ran **449 steps/epoch at batch 128**
-   = 57,425 samples = 41255 N + 849x7 S + 3409x3 V. Without augmentation it
-   would be 356 steps.
-   This **violates hard constraint 2** and additionally copies the RR
-   features unchanged across every duplicate, so the synthetic beats carry
-   identical rhythm context and teach the model nothing new about it.
-   **It will be removed in a later step.** Until then, treat every baseline
-   number as produced *with* augmentation active.
+1. **Augmentation was REMOVED in step 4.** It is no longer active.
+   `augment_training_data()` and `augment_segment()` are still defined in
+   `src/train.py` sections 9 and 10, but they are **dead code** - marked
+   `[DEPRECATED]`, with zero call sites (verified by AST call-graph, not
+   grep). Section 18 passes the training arrays straight through. Do not
+   re-enable them: synthetic beats violate hard constraint 2.
+
+   Class balancing now happens **in the loss**, via a per-class
+   `FOCAL_ALPHA` vector derived at runtime from the DS1_TRAIN counts as
+   `(1 / count_c) ** FOCAL_BETA`, rescaled to sum to `NUM_CLASSES`.
+
+   **History, so old numbers are read correctly.** Runs **baseline through
+   step 3** were produced *with* augmentation active: it expanded S x7 and
+   V x3 while copying the RR feature vector unchanged across every copy.
+   The baseline ran 449 steps/epoch at batch 128 = 57,425 samples
+   = 41255 N + 849x7 S + 3409x3 V; without augmentation it would have been
+   356. Treat every metric from those runs as produced under data
+   expansion.
 
    Do not try to detect augmentation from `train_distribution` in
    `metrics.json` - that field is computed **before** the split and before
    augmentation, so it can never reveal it. This exact mistake was made once
-   already.
+   already. Check `config.oversampling` (present from step 4 onward) or the
+   steps/epoch count instead.
 
 2. **Record 114 has leads `['V5', 'MLII']`** - the two channels are swapped
    relative to every other DS1 record. With `LEAD_INDEX = 0` the pipeline
@@ -50,13 +58,30 @@ Established, verified, and not to be re-litigated:
    lead into the model than the other 21 DS1 records.
    **To be fixed in a later step.**
 
-3. **Records 201 and 202 are the SAME SUBJECT** (per the PhysioNet
+3. **DS1_VAL changed at step 5**, from 3 records to 5:
+   `['207','220','223']` -> `['106','118','207','220','223']`.
+   With 3 records the selection signal was too noisy to trust - val
+   macro-F1 swung 0.7288 -> 0.5791 between consecutive epochs and the
+   selected peak sat 0.1627 above the surrounding plateau for exactly one
+   epoch. Record 220 also has zero V beats, so validation V-F1 rested on
+   only two records.
+   **Consequence for the ablation table: rows baseline through step 4 used
+   the 3-record validation set and are NOT directly comparable to step 5
+   onward.** Training also shrank from 44,076 to 39,774 beats, so
+   `FOCAL_ALPHA` shifts slightly - it is derived from DS1_TRAIN counts.
+   The selection rule is recorded in `metrics.json` under
+   `val_selection_rule` and must not be re-derived casually: changing
+   `DS1_VAL` again breaks comparability with everything before it.
+
+4. **Records 201 and 202 are the SAME SUBJECT** (per the PhysioNet
    documentation). 201 is in DS1, 202 is in DS2. This is a genuine subject
    leak across the train/test boundary, inherited from de Chazal et al. 2004.
    - **Do NOT change the record lists** to fix it - see hard constraint 3.
    - **Disclose it as a limitation** in the paper.
    - **Never place 201 in the validation set** - doing so would stack a
-     second leak on top of the first.
+     second leak on top of the first. It is in DS1_TRAIN, and so is 209
+     (which holds 383 of the 943 DS1 S beats and cannot be spared from
+     training).
 
 ---
 
@@ -72,19 +97,25 @@ Established, verified, and not to be re-litigated:
 
 ## Current state
 
-Baseline reproduced on Kaggle — commit `b58d6b6`, TensorFlow 2.20, NVIDIA P100.
+See `docs/ablation.md` for the full run-by-run table - it is the source of
+truth and every number there is read programmatically from a
+`results/<run>/metrics.json`.
 
-| metric | value |
-|---|---|
-| macro-F1 | 0.6358 |
-| S F1 | 0.1728 |
-| S recall | 0.1171 |
-| accuracy | 0.9294 |
+Best test macro-F1 so far is **step 2** (`5c1b9d6`) at 0.6800. The baseline
+(`b58d6b6`) scored 0.6358, but from a leaked validation split and the full
+22-record training pool, so it is not a fair target.
 
-**Blocking problem:** S beats are overwhelmingly classified as N. The
-confusion matrix shows 1243 of 1836 true S beats predicted as N, giving
-S recall of 0.1171. Fixing S sensitivity without collapsing N precision is
-the current research objective.
+| run | macro-F1 | S F1 | S recall | accuracy |
+|---|---|---|---|---|
+| baseline | 0.6358 | 0.1728 | 0.1171 | 0.9294 |
+| step 2 | 0.6800 | 0.1942 | 0.1280 | 0.9476 |
+| step 3 | 0.6645 | 0.2138 | 0.1514 | 0.9451 |
+
+**Blocking problem:** S beats are still misclassified, but the failure
+mode moved at step 3. It is no longer purely S->N: the patient-relative RR
+features cut S->N from 1350 to 692 of 1836, but those beats went to **V**
+(S->V 251 -> 866) rather than to S. Fixing S sensitivity without collapsing
+N precision or V precision is the current research objective.
 
 ---
 

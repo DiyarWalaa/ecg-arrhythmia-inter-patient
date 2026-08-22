@@ -157,13 +157,50 @@ DS2 = [
     '222', '228', '231', '232', '233', '234'
 ]
 
-# Patient-wise validation split (step 1).
+# Patient-wise validation split (step 1, enlarged at step 5).
 # Whole records are held out of training, never individual beats, so no
-# patient can appear on both sides. 207 / 220 / 223 are chosen because
-# they carry enough S beats (106 / 94 / 73) for val S-F1 to be a usable
-# selection signal. Record 201 is deliberately NOT used here: it is the
-# same subject as 202, which lives in DS2.
-DS1_VAL = ['207', '220', '223']
+# patient can appear on both sides.
+#
+# Step 5 grew this from 3 records to 5. With 3 records, val macro-F1 swung
+# 0.7288 -> 0.5791 between two consecutive epochs, and the selected peak
+# sat 0.1627 above the surrounding plateau for exactly one epoch. That
+# checkpoint then scored 0.5599 on test - we were selecting noise. More
+# records means a lower-variance selection signal.
+DS1_VAL = ['106', '118', '207', '220', '223']
+
+# Why these five, recorded so the choice is auditable and never quietly
+# re-derived. Written into metrics.json as val_selection_rule.
+VAL_SELECTION_RULE = {
+    "keep": {
+        "records": ['207', '220', '223'],
+        "reason": "the original step 1 validation set, kept so the "
+                  "selection signal stays comparable where possible"
+    },
+    "exclude": [
+        {
+            "record": "209",
+            "reason": "holds 383 of the 943 DS1 S beats; moving it to "
+                      "validation would starve training of S"
+        },
+        {
+            "record": "201",
+            "reason": "same subject as test record 202 (PhysioNet); "
+                      "validating on it would stack a second leak"
+        }
+    ],
+    "add": [
+        {
+            "record": "118",
+            "reason": "most S beats of the remaining candidates (96)"
+        },
+        {
+            "record": "106",
+            "reason": "most V beats among records with <= 5 S beats "
+                      "(520); 220 has zero V, so validation V-F1 rested "
+                      "on only two records"
+        }
+    ]
+}
 
 DS1_TRAIN = [rec for rec in DS1 if rec not in DS1_VAL]
 
@@ -1672,6 +1709,8 @@ metrics = {
         "ds1_train": DS1_TRAIN,
 
         "ds1_val": DS1_VAL,
+
+        "val_selection_rule": VAL_SELECTION_RULE,
 
         "rr_feature_names": RR_FEATURE_NAMES,
 

@@ -6,6 +6,15 @@ run's `results/<run>/metrics.json` - never typed from memory.
 Rules (see CLAUDE.md): ONE change per run, and nothing is ever tuned against
 DS2. All metrics below are on DS2 (inter-patient test set).
 
+> **Validation set changed at step 5.** Rows **baseline through step 4** used
+> a 3-record validation set, `DS1_VAL = ['207','220','223']`. From **step 5**
+> onward it is 5 records, `['106','118','207','220','223']`, and the training
+> pool shrinks from 44,076 to 39,774 beats. Test-set metrics below are all on
+> the same untouched DS2, so the columns remain meaningful - but model
+> *selection* changed, and `FOCAL_ALPHA` shifts because it is derived from
+> DS1_TRAIN counts. **Step 5 onward is not a like-for-like comparison with
+> what precedes it.**
+
 | step | description | commit | macro-F1 | S recall | S precision | S F1 | V F1 | accuracy |
 |---|---|---|---|---|---|---|---|---|
 | 0 | colleague's script, paths made configurable | `b58d6b6` | 0.6358 | 0.1171 | 0.3298 | 0.1728 | 0.7694 | 0.9294 |
@@ -13,6 +22,7 @@ DS2. All metrics below are on DS2 (inter-patient test set).
 | 1b | RR normalization fitted on training set only | `10e06f2` | 0.4742 | 0.0071 | 0.1806 | 0.0136 | 0.4641 | 0.8843 |
 | 2 | select on val macro-F1 instead of val_loss | `5c1b9d6` | 0.6800 | 0.1280 | 0.4024 | 0.1942 | 0.8718 | 0.9476 |
 | 3 | patient-relative RR ratio features (5 dimensionless) | `1a2509c` | 0.6645 | 0.1514 | 0.3634 | 0.2138 | 0.8004 | 0.9451 |
+| 4 | remove oversampling, per-class focal alpha | `3b67016` | pending | pending | pending | pending | pending | pending |
 
 ## Notes
 
@@ -31,6 +41,10 @@ DS2. All metrics below are on DS2 (inter-patient test set).
 - **step 3** (`step3_rr_ratios`) - train distribution N=40301 / S=670 / V=3105. Ran 18 epochs; selection on `val_macro_f1` chose **epoch 8** (best val macro-F1 0.5618); early stopping fired: True.
   **macro-F1 REGRESSED 0.6800 -> 0.6645.** But the S->N leak roughly halved: 1350 -> 692 of 1836 test S beats. Those beats did not become correct S predictions - they moved to **V** instead (S->V 251 -> 866), and V F1 fell 0.8718 -> 0.8004. S recall did rise 0.1280 -> 0.1514 and S F1 0.1942 -> 0.2138, so the ratio features do carry usable prematurity signal; the model is simply spending it on the wrong class boundary. **Stated condition: if step 4 does not recover macro-F1 above 0.6800, the ratio features get reconsidered.**
 
+- **step 4** (`step4_class_alpha`) - **NO ROW: the metrics file for this run is missing.** `results/step4_class_alpha/metrics.json` is byte-identical to `results/step3_rr_ratios/metrics.json` (sha256 `f6e91c1dcaf43d0b...`, same timestamp `2026-08-22T16:14:13.768739`, same `run_name: step3_rr_ratios`, scalar `focal_loss_alpha: 0.5`, no `oversampling` key). It is a copy of the step 3 run, not a step 4 run. Filling this row from it would put step 3's numbers under step 4's name.
+
+  Reported verbally but **not yet traceable to a metrics.json**: val macro-F1 0.7288 at epoch 3 falling to 0.5791 at epoch 4, a plateau averaging 0.5661 over epochs 4-13, and test macro-F1 0.5599 - the worst of any run. Those figures motivated step 5 and are recorded here as provenance, but they are **not** entered in the table until the real `metrics.json` arrives.
+
 ## Reading these numbers
 
 Steps 1 and 1b both **evaluated a one-epoch model**: `val_loss` rose
@@ -40,13 +54,16 @@ stopped the run at epoch 8. Their macro-F1 drop to 0.4569 / 0.4742 measures
 that selection failure, **not** the patient-wise split or the RR fix.
 
 Step 2 changed the selection metric and the same pipeline reached macro-F1
-0.6800. Step 2 is therefore the first row that reflects model quality, and it
-is the correct comparison point for everything that follows - not the
-baseline, whose 0.6358 came from a leaked validation split and the full
-22-record training pool.
+0.6800 - still the best result so far. Step 3 is the first step to move the
+S->N leak (73.5% -> 37.7%), at the cost of macro-F1, because the freed S
+beats went to V rather than to S.
 
-Step 3 is the first step to move the S->N leak (73.5% -> 37.7%), at the cost
-of macro-F1, because the freed S beats went to V rather than to S. Step 4
-tests whether that is a class-balancing problem rather than a feature problem:
-it removes duplicate oversampling and replaces the scalar focal alpha (which
-rebalanced nothing) with a per-class vector.
+Step 4 removed duplicate oversampling and replaced the scalar focal alpha
+(which rebalanced nothing) with a per-class vector. Note that swap is close
+to weight-neutral in relative terms - effective S:N emphasis moves only
+7.000x -> 7.756x - while cutting mean alpha per sample to 62% and
+steps/epoch from 425 to 345, so an epoch carries roughly half the loss mass
+it used to.
+
+Step 5 enlarges the validation set to cut selection variance. It changes no
+model, loss, feature or hyperparameter.
