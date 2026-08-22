@@ -85,6 +85,25 @@ tf.keras.utils.set_random_seed(SEED)
 tf.config.experimental.enable_op_determinism()
 
 
+def reset_seeds(seed=SEED):
+    """Re-seed every RNG so each BETA in the sweep starts identically.
+
+    Without this the later BETA values would train from different weight
+    initialisations and a difference in val macro-F1 could not be
+    attributed to BETA alone.
+    """
+
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+    random.seed(seed)
+
+    np.random.seed(seed)
+
+    tf.random.set_seed(seed)
+
+    tf.keras.utils.set_random_seed(seed)
+
+
 # =========================================================
 # 2. GPU CHECK
 # =========================================================
@@ -242,6 +261,11 @@ RR_CLIP_MAX = 3.0
 # It was previously the scalar 0.50, which multiplies every class by the
 # same factor and rebalances nothing - it just halved the effective loss.
 FOCAL_BETA = 0.5
+
+# Step 6: BETA was never validated, it was picked by convention. Sweep it
+# and let DS1_VAL choose. 0.0 gives alpha [1, 1, 1] - a no-reweighting
+# control: if it wins, the reweighting was never helping.
+BETA_GRID = [0.0, 0.25, 0.41, 0.50]
 
 FOCAL_GAMMA = 2.0
 
@@ -790,26 +814,35 @@ FOCAL_CLASS_COUNTS = [
     for _i in range(NUM_CLASSES)
 ]
 
-_alpha_raw = np.array(
-    [
-        (1.0 / _count) ** FOCAL_BETA if _count > 0 else 0.0
-        for _count in FOCAL_CLASS_COUNTS
-    ],
-    dtype=np.float64
-)
 
-FOCAL_ALPHA = (
-    _alpha_raw * (NUM_CLASSES / _alpha_raw.sum())
-).astype(np.float32)
+def compute_focal_alpha(class_counts, beta):
+    """Per-class focal alpha from training counts.
 
-print(f"\nFocal alpha (per class, beta={FOCAL_BETA}, "
-      f"rescaled to sum {NUM_CLASSES}):")
+    alpha_c = (1 / count_c) ** beta, rescaled so the vector sums to
+    NUM_CLASSES. beta = 0 gives a flat [1, 1, 1] - no reweighting at all.
+    """
 
-for _i in range(NUM_CLASSES):
-    print(f"  {INT_TO_LABEL[_i]}: count {FOCAL_CLASS_COUNTS[_i]:>6}  "
-          f"alpha {FOCAL_ALPHA[_i]:.4f}")
+    raw = np.array(
+        [
+            (1.0 / count) ** beta if count > 0 else 0.0
+            for count in class_counts
+        ],
+        dtype=np.float64
+    )
 
-print(f"  vector: {FOCAL_ALPHA.tolist()}  (sum {FOCAL_ALPHA.sum():.4f})")
+    return (raw * (NUM_CLASSES / raw.sum())).astype(np.float32)
+
+
+print(f"\nDS1_TRAIN class counts: {FOCAL_CLASS_COUNTS}")
+print(f"Focal alpha per BETA in the sweep grid {BETA_GRID}:")
+
+for _beta in BETA_GRID:
+    _a = compute_focal_alpha(FOCAL_CLASS_COUNTS, _beta)
+    print(f"  beta {_beta:<5} -> alpha "
+          f"{[round(float(_v), 4) for _v in _a]}  (sum {_a.sum():.4f})")
+
+# Set to the selected BETA's vector after the sweep in section 22.
+FOCAL_ALPHA = compute_focal_alpha(FOCAL_CLASS_COUNTS, FOCAL_BETA)
 
 
 # =========================================================
@@ -1138,12 +1171,13 @@ def build_model(ecg_shape, rr_shape):
     return model
 
 
-model = build_model(
-    ecg_shape=X_tr_aug.shape[1:],
-    rr_shape=(len(RR_FEATURE_NAMES),)
-)
+# The model is NOT built here any more. Section 22 builds one per BETA
+# in the sweep and keeps the one validation selects. build_model() reads
+# the module-level FOCAL_ALPHA when it compiles, so the sweep sets that
+# global before each call.
 
-model.summary()
+ECG_INPUT_SHAPE = X_tr_aug.shape[1:]
+RR_INPUT_SHAPE = (len(RR_FEATURE_NAMES),)
 
 
 # =========================================================
@@ -1235,62 +1269,174 @@ class ValidationMetrics(tf.keras.callbacks.Callback):
 
 CLASS_NAMES = [INT_TO_LABEL[i] for i in range(NUM_CLASSES)]
 
-val_metrics_cb = ValidationMetrics(
-    [X_val, RR_val],
-    y_val,
-    CLASS_NAMES
-)
 
-early_stopping = EarlyStopping(
-    monitor='val_macro_f1',
-    mode='max',
-    patience=10,
-    restore_best_weights=True
-)
+def make_callbacks():
+    """Fresh callback objects for one sweep run.
 
-reduce_lr = ReduceLROnPlateau(
-    monitor='val_macro_f1',
-    mode='max',
-    factor=0.5,
-    patience=5,
-    min_lr=1e-6
-)
+    EarlyStopping and ReduceLROnPlateau carry mutable state (wait, best,
+    stopped_epoch, best_weights), and ValidationMetrics accumulates its
+    records list, so they cannot be shared across BETA runs.
 
-# val_metrics_cb MUST be first: it writes 'val_macro_f1' into the shared
-# logs dict, and the two callbacks below read that key in the same
-# on_epoch_end pass.
-callbacks = [
+    Returns (callbacks, val_metrics_cb, early_stopping). val_metrics_cb
+    MUST be first in the list: it writes 'val_macro_f1' into the shared
+    logs dict and the two below read that key in the same on_epoch_end
+    pass.
+    """
 
-    val_metrics_cb,
-
-    early_stopping,
-
-    reduce_lr
-]
-
-
-# =========================================================
-# 22. TRAIN MODEL
-# =========================================================
-
-history = model.fit(
-
-    [X_tr_aug, RR_tr_aug],
-    y_tr_aug_cat,
-
-    validation_data=(
+    val_cb = ValidationMetrics(
         [X_val, RR_val],
-        y_val_cat
-    ),
+        y_val,
+        CLASS_NAMES
+    )
 
-    epochs=EPOCHS,
+    early = EarlyStopping(
+        monitor='val_macro_f1',
+        mode='max',
+        patience=10,
+        restore_best_weights=True
+    )
 
-    batch_size=BATCH_SIZE,
+    plateau = ReduceLROnPlateau(
+        monitor='val_macro_f1',
+        mode='max',
+        factor=0.5,
+        patience=5,
+        min_lr=1e-6
+    )
 
-    callbacks=callbacks,
+    return [val_cb, early, plateau], val_cb, early
 
-    verbose=1
+
+# =========================================================
+# 22. TRAIN MODEL - BETA SWEEP, SELECTED ON VALIDATION
+# =========================================================
+
+# One model per BETA, each from an identical seed reset. Selection is on
+# best val macro-F1 over DS1_VAL.
+#
+# THE TEST SET IS NOT TOUCHED IN THIS LOOP. No X_test / RR_test /
+# y_test_encoded appears below; DS2 is evaluated exactly once, in section
+# 24, on whichever model this loop selects.
+
+BETA_SWEEP = []
+
+model = None
+history = None
+val_metrics_cb = None
+early_stopping = None
+
+SELECTED_BETA = None
+BEST_SWEEP_VAL = None
+
+for sweep_beta in BETA_GRID:
+
+    print("\n" + "=" * 60)
+    print(f"SWEEP: BETA = {sweep_beta}")
+    print("=" * 60)
+
+    # Identical initialisation for every BETA, so any difference in val
+    # macro-F1 is attributable to BETA and not to weight init or shuffling.
+    reset_seeds()
+
+    sweep_alpha = compute_focal_alpha(FOCAL_CLASS_COUNTS, sweep_beta)
+
+    print(f"  alpha: {[round(float(v), 4) for v in sweep_alpha]}  "
+          f"(sum {sweep_alpha.sum():.4f})")
+
+    # build_model() reads this global when it compiles the loss.
+    FOCAL_ALPHA = sweep_alpha
+
+    sweep_callbacks, sweep_val_cb, sweep_early = make_callbacks()
+
+    sweep_model = build_model(
+        ecg_shape=ECG_INPUT_SHAPE,
+        rr_shape=RR_INPUT_SHAPE
+    )
+
+    if sweep_beta == BETA_GRID[0]:
+        sweep_model.summary()
+
+    sweep_history = sweep_model.fit(
+
+        [X_tr_aug, RR_tr_aug],
+        y_tr_aug_cat,
+
+        validation_data=(
+            [X_val, RR_val],
+            y_val_cat
+        ),
+
+        epochs=EPOCHS,
+
+        batch_size=BATCH_SIZE,
+
+        callbacks=sweep_callbacks,
+
+        verbose=1
+    )
+
+    sweep_curve = [
+        float(rec["val_macro_f1"])
+        for rec in sweep_val_cb.records
+    ]
+
+    if sweep_curve:
+        sweep_best = float(max(sweep_curve))
+        sweep_best_epoch = int(sweep_curve.index(sweep_best)) + 1
+    else:
+        sweep_best = float("-inf")
+        sweep_best_epoch = None
+
+    BETA_SWEEP.append({
+        "beta": float(sweep_beta),
+        "alpha": [float(v) for v in sweep_alpha],
+        "best_val_macro_f1": sweep_best,
+        "best_epoch": sweep_best_epoch,
+        "epochs_run": len(sweep_curve),
+        "early_stopping_fired": int(sweep_early.stopped_epoch) > 0,
+        "val_macro_f1_curve": sweep_curve
+    })
+
+    print(f"\n  BETA {sweep_beta}: best val macro-F1 {sweep_best:.4f} "
+          f"at epoch {sweep_best_epoch} of {len(sweep_curve)}")
+
+    if BEST_SWEEP_VAL is None or sweep_best > BEST_SWEEP_VAL:
+
+        BEST_SWEEP_VAL = sweep_best
+        SELECTED_BETA = float(sweep_beta)
+
+        # Keep this run's objects; sections 22B onward use these names.
+        model = sweep_model
+        history = sweep_history
+        val_metrics_cb = sweep_val_cb
+        early_stopping = sweep_early
+
+
+# --- selection, still without touching DS2 ------------------------------
+
+FOCAL_ALPHA = compute_focal_alpha(FOCAL_CLASS_COUNTS, SELECTED_BETA)
+
+SELECTION_CRITERION = (
+    "highest best val macro-F1 on DS1_VAL across BETA_GRID; the test set "
+    "was not evaluated during the sweep and is scored exactly once, in "
+    "section 24, on the selected model"
 )
+
+print("\n" + "=" * 60)
+print("BETA SWEEP RESULT")
+print("=" * 60)
+print(f"  {'beta':>6} {'best val macro-F1':>19} {'best epoch':>11} "
+      f"{'epochs':>7}  alpha")
+
+for entry in BETA_SWEEP:
+    marker = "  <-- selected" if entry["beta"] == SELECTED_BETA else ""
+    print(f"  {entry['beta']:>6} {entry['best_val_macro_f1']:>19.4f} "
+          f"{str(entry['best_epoch']):>11} {entry['epochs_run']:>7}  "
+          f"{[round(v, 4) for v in entry['alpha']]}{marker}")
+
+print(f"\n  selected BETA: {SELECTED_BETA}")
+print(f"  selected alpha: {[round(float(v), 4) for v in FOCAL_ALPHA]}")
+print(f"  criterion: {SELECTION_CRITERION}")
 
 
 # =========================================================
@@ -1692,7 +1838,11 @@ metrics = {
 
         "focal_loss_alpha": FOCAL_ALPHA.tolist(),
 
-        "focal_loss_beta": FOCAL_BETA,
+        "focal_loss_beta": SELECTED_BETA,
+
+        "focal_loss_beta_default": FOCAL_BETA,
+
+        "beta_grid": BETA_GRID,
 
         "focal_loss_gamma": FOCAL_GAMMA,
 
@@ -1750,6 +1900,12 @@ metrics = {
     "confusion_matrix": cm.tolist(),
 
     "per_class_roc_auc": per_class_roc_auc,
+
+    "beta_sweep": BETA_SWEEP,
+
+    "selected_beta": SELECTED_BETA,
+
+    "selection_criterion": SELECTION_CRITERION,
 
     "best_epoch": BEST_EPOCH,
 
