@@ -1,6 +1,7 @@
 # Last report
 
-**Task:** step 1b - fit RR normalization on the training set only.
+**Task:** step 2 - validation instrumentation and model selection on macro-F1.
+Also: added the step 1 and step 1b runs to `docs/ablation.md`.
 
 **Date:** 2026-08-22
 
@@ -8,39 +9,89 @@
 
 ## What changed
 
-- Replaced `normalize_rr()` with two functions in section 6:
-  - `fit_rr_norm(rr_array)` - computes mean and std **per column**
-    (`axis=0`, so `prev_rr` and `next_rr` get their own statistics rather
-    than one scalar over both columns and all rows), returns a `(2,)` mean
-    and a `(2,)` std, and replaces any zero std with `1.0` so a
-    zero-variance column is centred but never divided by zero.
-  - `apply_rr_norm(rr_array, mean, std)` - applies already-fitted
-    statistics. It cannot fit, by construction.
-- Section 15 now fits **once on `RR_train` (DS1_TRAIN) only** and applies
-  those same two vectors to `RR_train`, `RR_valid` and `RR_test`. All three
-  sets now land on one scale, and no validation or test statistic enters the
-  pipeline.
-- The fitted values are printed, labelled by column.
-- Added `config.rr_norm_mean` and `config.rr_norm_std` to `metrics.json`, as
-  lists.
-- `normalize_rr` is gone entirely - `grep` returns no occurrences, so no dead
-  function is left behind.
-- `normalize_segment()` (the per-beat ECG normalizer used inside
-  `extract_beats_from_record` and `augment_segment`) was **not** touched.
-  Verified by AST comparison, not by eye.
+**Validation instrumentation**
 
-Nothing else changed: no model, loss, hyperparameter, augmentation, or split
-change. `DS1_VAL` is still `['207','220','223']`.
+- New `ValidationMetrics` Keras callback (section 21). At each epoch end it
+  predicts on the validation set and computes macro-F1, per-class F1, recall,
+  precision and support, and the validation confusion matrix.
+- It writes `val_macro_f1` and `val_f1_N` / `val_f1_S` / `val_f1_V` into the
+  `logs` dict, so EarlyStopping, ReduceLROnPlateau and `History` all see them.
+- It prints a compact per-epoch line:
+  `epoch N  val macro-F1 x.xxxx   N-F1 ...  S-F1 ...  V-F1 ...`
+- The callback is **first** in the callbacks list. Keras hands one shared
+  `logs` dict to every callback in `on_epoch_end` in list order, so the
+  metric must be written before the two callbacks that read it.
+
+**Model selection**
+
+- `EarlyStopping`: `monitor='val_macro_f1'`, `mode='max'`, `patience=10`,
+  `restore_best_weights=True`.
+- `ReduceLROnPlateau`: `monitor='val_macro_f1'`, `mode='max'`, `factor=0.5`,
+  `patience=5`, `min_lr=1e-6`.
+
+**Diagnostics after training** (new section 22B)
+
+- `best_epoch` and `best_val_macro_f1`, taken as the argmax over the
+  callback's own per-epoch records.
+- Per-record breakdown over 207 / 220 / 223 separately: beat count, accuracy,
+  macro-F1, and per-class support / recall / precision / F1 plus a confusion
+  matrix. Printed, and written to `metrics.json` under `val_per_record`.
+- To make that possible, DS1_VAL is now loaded **one record at a time** and
+  concatenated, keeping a `val_record_ids` array. Same records, same order,
+  same beats - verified byte-identical to the single call (see Verification).
+
+**Persistence**
+
+- `metrics.json` gains `best_epoch`, `best_val_macro_f1`,
+  `early_stopping_fired` and `val_per_record`.
+- `history.json` gains `val_metrics_per_epoch` with the full per-epoch
+  validation record. The scalar `val_macro_f1` and `val_f1_*` series arrive
+  automatically through Keras `History` because the callback wrote them into
+  `logs`.
+- Added `precision_recall_fscore_support` to the existing `sklearn.metrics`
+  import.
+
+**Ablation table** - `docs/ablation.md` now carries step 1 and step 1b, read
+programmatically from their `metrics.json`. Both rows record that
+EarlyStopping restored epoch 1; the step 1b note records that DS2
+preprocessing also changed, so it is not a single-variable comparison against
+the baseline.
+
+Nothing else changed: no model architecture, loss, learning rate,
+augmentation, RR feature, or split change. `DS1_VAL` is still
+`['207','220','223']`.
 
 ---
 
 ## Files touched
 
-- `src/train.py` - section 6 (normalization functions), section 15, and the
-  metrics config block
+- `src/train.py` - sklearn import, section 12 (val loading with provenance),
+  section 21 (callback + monitors), new section 22B, metrics block, history
+  block
+- `docs/ablation.md` - regenerated with three rows
+- `results/step1_patient_val/`, `results/step1b_rr_trainstats/` - committed
 - `docs/last_report.md` - this file
 
-`docs/ablation.md` was **not** touched: see Problems item 3.
+---
+
+## Step 1b predictions - scorecard
+
+I made three falsifiable predictions last step. The runs are now in, so:
+
+| # | prediction | outcome |
+|---|---|---|
+| 1 | steps/epoch stays 425 | **PASS** (indirect) - `train_distribution` is exactly N=40301 / S=670 / V=3105 as predicted, which fixes the post-augmentation count at 54,306 = 425 steps |
+| 2 | prints mean `[274.881103515625, 275.1480712890625]`, std `[77.20227813720703, 75.38490295410156]` | **PASS** - `config.rr_norm_mean` and `config.rr_norm_std` match to all 16 digits |
+| 3 | val_accuracy clears 0.8528 | **FAIL** - peaked at 0.7390, up only 0.0022 from step 1's 0.7368 |
+
+**Prediction 3 failing matters more than the other two passing.** I argued the
+RR scale mismatch was why validation sat below trivial. It was a real defect
+and fixing it was correct, but it was **not** the cause: removing a 20.5%
+scale error moved peak val_accuracy by 0.002. The below-trivial validation
+performance has a different source, and step 2's per-record and per-class
+instrumentation exists precisely to find it. Current suspects, in order:
+the model over-predicting V (augmentation gives V x3 and focal loss pushes
+minority recall), and the record 114 lead swap.
 
 ---
 
@@ -54,22 +105,23 @@ $ echo $?
 0
 ```
 
-Passed, exit code 0.
-
-**No changed line falls inside a protected function** (AST line-span method,
-applied to both sides of the diff - 42 added lines, 9 deleted lines):
+**No changed line inside a protected function** (AST line-span method, both
+sides of the diff - 262 added, 20 deleted):
 
 | function | lines (new) | added-side | deleted-side |
 |---|---|---|---|
-| `build_model` | 771-916 | CLEAN | CLEAN |
-| `categorical_focal_loss` | 536-570 | CLEAN | CLEAN |
-| `augment_segment` | 404-446 | CLEAN | CLEAN |
-| `augment_training_data` | 453-529 | CLEAN | CLEAN |
-| `extract_beats_from_record` | 276-348 | CLEAN | CLEAN |
+| `build_model` | 796-941 | CLEAN | CLEAN |
+| `categorical_focal_loss` | 537-571 | CLEAN | CLEAN |
+| `augment_segment` | 405-447 | CLEAN | CLEAN |
+| `augment_training_data` | 454-530 | CLEAN | CLEAN |
+| `extract_beats_from_record` | 277-349 | CLEAN | CLEAN |
+| `fit_rr_norm` | 242-258 | CLEAN | CLEAN |
+| `apply_rr_norm` | 261-270 | CLEAN | CLEAN |
 
-Additionally `normalize_segment` was compared by `ast.dump` against the
-pre-edit file: **identical**. It sits next to the function I replaced and
-feeds two protected functions, so eyeballing it was not good enough.
+Stronger check, since line spans alone can miss a same-line edit: every
+function present in both versions was compared by `ast.dump`. **Zero
+pre-existing functions changed.** The only functions added are `__init__` and
+`on_epoch_end`, the two methods of the new callback class.
 
 **Constants unchanged**
 
@@ -82,184 +134,119 @@ feeds two protected functions, so eyeballing it was not good enough.
 | `PRE_SAMPLES = 90` | 1 |
 | `POST_SAMPLES = 144` | 1 |
 
-**Record literals unchanged** (extracted and hashed against the pre-edit file)
+**Record literals unchanged**
 
 ```
 DS1      IDENTICAL  sha256 9f20e3ac1758a312...
 DS2      IDENTICAL  sha256 b8a3e6bbdeeec72a...
 DS1_VAL  IDENTICAL  sha256 0d9df3612a6111a1...
-
-DS1_TRAIN = [rec for rec in DS1 if rec not in DS1_VAL]
 ```
 
-The DS1 and DS2 hashes are the same values recorded in the step 1 report, so
-the lists are unchanged across both steps.
+Same hashes as steps 1 and 1b.
 
-**Numerical test on the real data.** `fit_rr_norm` and `apply_rr_norm` were
-lifted out of the edited `src/train.py` by AST (so the test exercises the
-shipped code, not a copy), and run against RR features extracted from the
-actual MIT-BIH records with the same beat-selection rule as
-`extract_beats_from_record`. No TensorFlow needed.
+**Behavioural test without TensorFlow.** `load_dataset`,
+`extract_beats_from_record`, `normalize_segment` and the `ValidationMetrics`
+class were lifted out of the edited `src/train.py` by AST - so the test
+exercises the shipped code - and run against the real MIT-BIH records with a
+stubbed `tf.keras.callbacks.Callback` and a fake model.
+
+`scikit-learn` is not installed on this machine (CLAUDE.md: tools need only
+wfdb + numpy), so `precision_recall_fscore_support` and `confusion_matrix`
+were replaced with numpy reference implementations matching sklearn's
+`average=None` semantics. The test therefore validates **my** aggregation and
+plumbing, not sklearn's arithmetic. I did not install packages into your
+environment to get around this.
 
 ```
-lifted: ['apply_rr_norm', 'fit_rr_norm']
-extracting RR features ...
-shapes: (44076, 2) (6494, 2) (49289, 2)
+A) per-record load vs single load_dataset(DS1_VAL)
+Loading record 207 ...
+Loading record 220 ...
+Loading record 223 ...
+Loading record 207 ...
+Loading record 220 ...
+Loading record 223 ...
+   shapes single (6494, 234)  per-record (6494, 234)
+   arrays byte-identical: True -> PASS
+   record ids length 6494 == beats 6494 : True
+     207 -> 1858 beats
+     220 -> 2046 beats
+     223 -> 2590 beats
 
-OLD (step 1) - each set fitted on itself, scalar stats:
-  train mean/std:  275.015   76.299
-  val   mean/std:  289.605   60.672   <- different scale
-  test  mean/std:  282.492   87.781   <- different scale
-  val mean is 5.3% off train; val std is -20.5% off train
+B) ValidationMetrics callback
+   class lifted from src/train.py OK
+  epoch   1  val macro-F1 0.2367   N-F1 0.4912  S-F1 0.0680  V-F1 0.1510
+  epoch   1  val macro-F1 0.3068   N-F1 0.9205  S-F1 0.0000  V-F1 0.0000
+   all-N model: macro-F1 0.3068 vs accuracy 0.8528
+   [PASS] val_macro_f1 in logs
+   [PASS] val_macro_f1 correct
+   [PASS] macro-F1 == mean of 3 per-class F1
+   [PASS] val_f1_N in logs & correct
+   [PASS] val_f1_S in logs & correct
+   [PASS] val_f1_V in logs & correct
+   [PASS] pre-existing log keys preserved
+   [PASS] records has 1 entry, epoch 1-based
+   [PASS] record key val_macro_f1
+   [PASS] record key val_f1
+   [PASS] record key val_recall
+   [PASS] record key val_precision
+   [PASS] record key val_support
+   [PASS] record key val_confusion_matrix
+   [PASS] recall matches sklearn
+   [PASS] precision matches sklearn
+   [PASS] support sums to n beats
+   [PASS] confusion matrix 3x3 and sums to n
+   [PASS] all-N degenerate: no crash, S/V F1 == 0
+   [PASS] all-N macro-F1 < all-N accuracy (the whole point)
 
-NEW (step 1b) - fitted once on DS1_TRAIN, per column:
-  mean: [274.881103515625, 275.1480712890625]
-  std : [77.20227813720703, 75.38490295410156]
-
-  after applying TRAIN stats to all three:
-    train col means [-0.0, -0.0]  col stds [1.0, 1.0]
-    val   col means [0.1890999972820282, 0.19339999556541443]  col stds [0.7914000153541565, 0.7990999817848206]
-    test  col means [0.10970000177621841, 0.08609999716281891]  col stds [1.1380000114440918, 1.1634000539779663]
-  same-transform check: PASS
-
-zero-variance guard: std -> [1.0, 1.0] output all zeros & finite: True -> PASS
-mixed constant/varying columns: finite: True  varying col std -> 1.0 -> PASS
-
-per-column vs scalar - the reason axis=0 matters:
-  col means (raw train): [274.8810119628906, 275.14801025390625]
-  col stds  (raw train): [77.2020034790039, 75.38500213623047]
-  scalar mean/std over both cols: 275.015 76.299
+C) per-record breakdown logic
+   record 207:  1858 beats  support {'N': 1542, 'S': 106, 'V': 210}
+   record 220:  2046 beats  support {'N': 1952, 'S': 94, 'V': 0}
+   record 223:  2590 beats  support {'N': 2044, 'S': 73, 'V': 473}
+   masks partition the val set exactly: True -> PASS
+   per-record supports sum to val totals {'N': 5538, 'S': 273, 'V': 683} == {'V': 683, 'N': 5538, 'S': 273} : True -> PASS
 
 OVERALL: PASS
 ```
 
-**This confirms the diagnosis.** Under the step 1 behaviour the validation
-set was scaled by its own std of **60.672** against training's **76.299** -
-**20.5% smaller**. Every validation RR feature was therefore inflated by
-roughly 1.26x relative to the scale the model was trained on, which is a
-feature distribution mismatch, exactly as you called it. After the fix,
-validation sits at mean +0.19 and std 0.79 *on the training scale* - a real,
-modest patient-to-patient difference rather than a fabricated rescaling.
+Three things worth pulling out of that output:
 
----
+- **Per-record loading is byte-identical** to `load_dataset(DS1_VAL, ...)` for
+  X, y and RR. The provenance tracking changes nothing about the data.
+- **Per-record supports match `docs/ds1_beat_counts.txt` exactly** (207:
+  1542/106/210, 220: 1952/94/0, 223: 2044/73/473), an independent
+  cross-check that the masks are correct.
+- **On an all-N model the new metric reads macro-F1 0.3068 while accuracy
+  reads 0.8528.** That gap is the entire justification for the change: the
+  old signal rewards ignoring S, the new one does not.
 
-## Falsifiable predictions for the next Kaggle run
+**Falsifiable predictions for the next Kaggle run**
 
-1. **Steps/epoch must stay at 425.** Nothing about the split, the record
-   lists, or the augmentation changed, so the training set is still
-   40301 N + 670x7 S + 3105x3 V = 54,306 samples = 425 steps/epoch at batch
-   128. **If steps/epoch is not 425, this change did something it should not
-   have.**
-2. **The run must print exactly**
-   `mean (prev_rr, next_rr): [274.881103515625, 275.1480712890625]` and
-   `std  (prev_rr, next_rr): [77.20227813720703, 75.38490295410156]`.
-   I computed these locally from the same records the script will load. Any
-   deviation means Kaggle is reading different data than this machine.
-3. **val_accuracy should now clear 0.8528**, the all-N rate on this
-   validation set (5538 N of 6494 beats). Step 1 peaked at 0.7368, i.e. below
-   trivial. If it stays below 0.8528, the scale mismatch was not the whole
-   story and the next suspect is the record 114 lead swap.
+1. **The run trains past epoch 8.** Under `val_macro_f1` with `patience=10`,
+   epoch 1 is no longer the best epoch - epoch 1's val macro-F1 is low because
+   the model is near all-N at that point. I expect `best_epoch >= 5` and
+   `early_stopping_fired` either false (ran all 40) or with
+   `stopped_epoch > 15`. **If `best_epoch` comes back as 1 again, selecting on
+   macro-F1 did not change the outcome and the problem is upstream of model
+   selection.**
+2. **`val_per_record` will show record 220 with `support.V = 0`** and
+   therefore `recall.V = 0.0`, because 220 genuinely contains no V beats.
+   That is a display artefact, not a model failure - see Problems.
+3. **Test macro-F1 will exceed step 1b's 0.4742**, because the evaluated model
+   will have trained for more than one epoch. I am *not* predicting it beats
+   the baseline's 0.6358: the baseline had a leaked validation split and the
+   full 22-record training pool, so it is not a fair target.
 
-Prediction 3 is the real test of the hypothesis. Predictions 1 and 2 are
-guards that the change was surgical.
-
----
-
-## git diff
-
-```diff
-diff --git a/src/train.py b/src/train.py
-index 82a5d22..25ac4df 100644
---- a/src/train.py
-+++ b/src/train.py
-@@ -238,15 +238,33 @@ def normalize_segment(segment):
-     return (segment - mean) / std
- 
- 
--def normalize_rr(rr_array):
-+def fit_rr_norm(rr_array):
-+    """Fit per-column RR statistics on the TRAINING set only.
-+
-+    RR is [prev_rr, next_rr], so the statistics are per column (axis=0),
-+    not one scalar over both columns as before. Returns (mean, std), each
-+    shape (2,). A zero-variance column gets std 1.0 so it is only centred,
-+    never divided by zero.
-+    """
- 
-     rr_array = np.array(rr_array, dtype=np.float32)
- 
--    mean = np.mean(rr_array)
--    std = np.std(rr_array)
-+    mean = np.mean(rr_array, axis=0)
-+    std = np.std(rr_array, axis=0)
- 
--    if std == 0:
--        return rr_array - mean
-+    std = np.where(std == 0.0, 1.0, std)
-+
-+    return mean.astype(np.float32), std.astype(np.float32)
-+
-+
-+def apply_rr_norm(rr_array, mean, std):
-+    """Apply already-fitted RR statistics.
-+
-+    Never fits. Validation and test are scaled with the training set's
-+    mean and std so all three land on the same scale.
-+    """
-+
-+    rr_array = np.array(rr_array, dtype=np.float32)
- 
-     return (rr_array - mean) / std
- 
-@@ -655,9 +673,20 @@ y_test_encoded = np.array([
- # 15. NORMALIZE RR
- # =========================================================
- 
--RR_train = normalize_rr(RR_train)
--RR_valid = normalize_rr(RR_valid)
--RR_test = normalize_rr(RR_test)
-+# Fitted on DS1_TRAIN only. Fitting on validation or test would leak
-+# their distribution into the pipeline; fitting each set separately (the
-+# step 1 behaviour) put the three on three different scales, which is why
-+# step 1 val_accuracy peaked at 0.7368, below the 0.8528 an all-N
-+# prediction scores on that validation set.
-+RR_NORM_MEAN, RR_NORM_STD = fit_rr_norm(RR_train)
-+
-+print("\nRR normalization fitted on DS1_TRAIN only:")
-+print(f"  mean (prev_rr, next_rr): {RR_NORM_MEAN.tolist()}")
-+print(f"  std  (prev_rr, next_rr): {RR_NORM_STD.tolist()}")
-+
-+RR_train = apply_rr_norm(RR_train, RR_NORM_MEAN, RR_NORM_STD)
-+RR_valid = apply_rr_norm(RR_valid, RR_NORM_MEAN, RR_NORM_STD)
-+RR_test = apply_rr_norm(RR_test, RR_NORM_MEAN, RR_NORM_STD)
- 
- 
- # =========================================================
-@@ -1247,7 +1276,11 @@ metrics = {
- 
-         "ds1_train": DS1_TRAIN,
- 
--        "ds1_val": DS1_VAL
-+        "ds1_val": DS1_VAL,
-+
-+        "rr_norm_mean": RR_NORM_MEAN.tolist(),
-+
-+        "rr_norm_std": RR_NORM_STD.tolist()
-     },
- 
-     "train_distribution": {
-```
+Prediction 1 is the real test of step 2.
 
 ---
 
 ## Commit
 
 ```
-10e06f2  step 1b: fit RR normalization on training set only
+5c1b9d6  step 2: validation instrumentation, select on macro-F1
 ```
 
-Pushed to `origin/main`; `git status -sb` reports `## main...origin/main` with
-no divergence. This report lands in a small follow-up commit, as before.
+Pushed to `origin/main`. This report lands in a small follow-up commit.
 
 ---
 
@@ -278,7 +265,13 @@ no divergence. This report lands in a small follow-up commit, as before.
 ├── notebooks/
 │   └── .gitkeep
 ├── results/
-│   └── baseline/
+│   ├── baseline/
+│   │   └── metrics.json
+│   ├── step1_patient_val/
+│   │   ├── history.json
+│   │   └── metrics.json
+│   └── step1b_rr_trainstats/
+│       ├── history.json
 │       └── metrics.json
 ├── src/
 │   └── train.py
@@ -291,37 +284,38 @@ no divergence. This report lands in a small follow-up commit, as before.
 
 ## Problems
 
-1. **The per-column change barely moves the numbers here, and I want that on
-   the record rather than overclaimed.** The two RR columns turn out to have
-   nearly identical statistics (mean 274.88 vs 275.15, std 77.20 vs 75.38,
-   against the old scalar 275.02 / 76.30). `axis=0` is the correct thing to
-   do and it is now correct, but on this dataset it is a rounding-level
-   difference. **The fix that matters is fitting on training only** - that is
-   what removes the 20.5% scale mismatch. If step 1b improves val_accuracy,
-   credit the train-only fit, not the per-column split.
+1. **Record 220 has zero V beats**, so its per-record V recall will always
+   print `0.0000` with `support 0`. That is `zero_division=0` doing its job,
+   not the model failing on 220. Read `support` before reading `recall` in
+   `val_per_record`. Worth knowing before this table gets read as evidence.
 
-2. **Test data is now scaled by training statistics, which is a change to how
-   DS2 is processed** - previously DS2 was normalized by its own statistics.
-   This is strictly more correct and is *required* by the no-tuning-against-
-   DS2 rule (fitting a scaler on DS2 is fitting a parameter on the test set),
-   but it does mean baseline and step 1 test numbers were produced under a
-   different preprocessing than step 1b's will be. Worth one sentence in the
-   paper's methods section.
+2. **`restore_best_weights` does not always restore.** In Keras, EarlyStopping
+   restores the best weights only when it actually fires; if training reaches
+   the final epoch the last epoch's weights are kept. With `patience=10` and
+   `EPOCHS=40` that is now a live possibility. I did not change the behaviour,
+   but I added `early_stopping_fired` to `metrics.json` and a printed warning
+   so `best_epoch` is never silently mistaken for "the epoch that was
+   evaluated". This is one field beyond your list of seven - flagging it as an
+   addition rather than burying it.
 
-3. **There is still no `metrics.json` for step 1 or step 1b in `results/`.**
-   The step 1 run happened - you quoted val_accuracy 0.7368 over 8 epochs -
-   but its metrics never came back into the repo, so `docs/ablation.md` still
-   holds only the baseline row. Under the "every number must trace to a
-   `results/<run>/metrics.json`" rule I did not add rows for either step. Drop
-   `results/step1/metrics.json` and `results/step1b/metrics.json` in and I
-   will fill both rows.
+3. **The callback adds a full validation forward pass per epoch.** DS1_VAL is
+   6,494 beats against 54,306 training samples, so roughly 12% more inference
+   work per epoch on top of the validation pass Keras already runs. Expect
+   epochs to be modestly slower. Not a correctness issue, but it is real cost.
 
-4. **Record 114's lead swap is still unfixed** and is the leading remaining
-   suspect if prediction 3 fails. It is in DS1_TRAIN, so it is currently
-   feeding V5 into a model that sees MLII from the other 18 training records.
-   Already logged in CLAUDE.md under Known facts.
+4. **`best_epoch` is computed from the callback's records, not read back out
+   of EarlyStopping.** They should agree, since both take the argmax of the
+   same `val_macro_f1` series. If a future run shows them disagreeing, trust
+   EarlyStopping and treat it as a bug in section 22B.
 
-5. Carried over, unchanged: augmentation is still active (S x7, V x3, still
-   violating hard constraint 2, still queued for removal);
-   `tools/inspect_ds1.py` still writes its JSON into `tools/`; the stale root
-   `__pycache__/` is still there.
+5. **Steps 1 and 1b are not clean comparisons and the table now says so.**
+   Both evaluated one-epoch models, so their macro-F1 drop measures the
+   `val_loss` selection failure, not the split or the RR fix. Step 1b
+   additionally changed DS2 preprocessing. The first genuinely comparable
+   number will come from the next run.
+
+6. Carried over, unchanged: augmentation still active (S x7, V x3, still
+   violating hard constraint 2); record 114 lead swap still unfixed and now
+   the leading suspect for the below-trivial validation;
+   `tools/inspect_ds1.py` still writes its JSON into `tools/`; stale root
+   `__pycache__/` still present.
