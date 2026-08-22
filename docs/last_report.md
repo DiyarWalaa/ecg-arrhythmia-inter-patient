@@ -1,7 +1,8 @@
 # Last report
 
-**Task:** step 3 - replace raw RR features with patient-relative ratios.
-Also: added the step 2 run to `docs/ablation.md`.
+**Task:** step 4 - remove duplicate oversampling, replace the scalar focal
+alpha with a per-class vector. Also: added the step 3 run to
+`docs/ablation.md`.
 
 **Date:** 2026-08-22
 
@@ -9,87 +10,69 @@ Also: added the step 2 run to `docs/ablation.md`.
 
 ## What changed
 
-`extract_beats_from_record` now returns **five dimensionless ratios** instead
-of two raw sample counts.
-
-Per record, computed once before the beat loop:
+**Oversampling removed.** Section 18 no longer calls
+`augment_training_data()`. It assigns the training arrays straight through:
 
 ```python
-rr_series = np.diff(ann_samples)          # interval ending at beat k is rr_series[k-1]
-median_rr = np.median(rr_series)          # falls back to 1.0 if empty or <= 0
+X_tr_aug = X_tr
+RR_tr_aug = RR_tr
+y_tr_aug = y_tr
 ```
 
-Per beat `i`:
+The `*_aug` names are kept so nothing downstream changes. Both
+`augment_training_data()` and `augment_segment()` remain defined but are
+**unreachable**, and their section headers are now marked
+`[DEPRECATED - unused since step 4]` with a comment saying not to re-enable
+them.
 
-| # | feature | definition |
-|---|---|---|
-| 1 | `pre_RR_over_median` | `pre_RR / median_RR_record` |
-| 2 | `post_RR_over_median` | `post_RR / median_RR_record` |
-| 3 | `local_RR_over_median` | `local_RR / median_RR_record` |
-| 4 | `pre_RR_over_local` | `pre_RR / local_RR` |
-| 5 | `post_RR_over_pre` | `post_RR / pre_RR` |
+**Focal alpha is now per-class.** `categorical_focal_loss(alpha, gamma=2.0)`
+takes a length-3 vector, converted once to a `tf.constant` and broadcast over
+the class axis of `y_pred` (batch, 3). `alpha` is now a **required** argument
+with no default - the old signature defaulted to the scalar `0.50`, and I did
+not want that silently reachable again.
 
-`local_RR` is the mean of the `RR_LOCAL_WINDOW = 10` intervals immediately
-**before** this beat's own `pre_RR` - slice `rr_series[i-1-W : i-1]`. Beats
-with fewer than 10 preceding intervals fall back to `median_RR_record`.
+Derived at runtime in section 12 from DS1_TRAIN counts only:
 
-**On that interpretation:** "the previous 10 RR intervals" excludes the
-beat's own `pre_RR`. That is what makes feature 4 a prematurity measure -
-current interval against recent local rhythm. Including `pre_RR` in its own
-denominator would dilute exactly the signal the feature exists to capture. On
-record 209 the fallback branch is taken by 11 beats.
+```
+alpha_c = (1 / count_c) ** FOCAL_BETA,  rescaled so sum(alpha) == NUM_CLASSES
+```
 
-Every feature is clipped to `[0.2, 3.0]` after computation. Division guards:
-`median_rr <= 0` or non-finite falls back to `1.0`; `local_rr <= 0` or
-non-finite falls back to `median_rr`; `pre_rr <= 0` falls back to `median_rr`
-as feature 5's denominator.
+**Constants hoisted** into section 3: `FOCAL_BETA = 0.5`,
+`FOCAL_GAMMA = 2.0`, `ADAM_LEARNING_RATE = 1e-4`. The learning-rate *value* is
+unchanged - only the literal moved.
 
-**Downstream**
+**metrics.json config** now carries `focal_loss_alpha` (the computed vector),
+`focal_loss_beta`, `focal_loss_gamma`, `focal_alpha_class_counts`,
+`oversampling: false`, and `adam_learning_rate`, so a run's loss configuration
+is fully recoverable from its own metrics file.
 
-- `fit_rr_norm` / `apply_rr_norm` unchanged, still fitted on DS1_TRAIN only.
-  Both are already `axis=0` and shape-agnostic, so they went from 2 columns
-  to 5 with no edit.
-- `build_model` call site: `rr_shape=(2,)` -> `rr_shape=(len(RR_FEATURE_NAMES),)`.
-  I used the length of the names list rather than a literal `(5,)` so the two
-  cannot drift apart in a later step. It evaluates to `(5,)` today.
-- New section 3 constants: `RR_FEATURE_NAMES`, `RR_LOCAL_WINDOW = 10`,
-  `RR_CLIP_MIN = 0.2`, `RR_CLIP_MAX = 3.0`.
-- `metrics.json` config gains `rr_feature_names`, plus `rr_local_window` and
-  `rr_clip` so a run's feature definition is fully recoverable from its own
-  metrics file.
-- Section 15 prints min / max / mean / median and the percentage of values
-  sitting at each clip bound, per feature, for DS1_TRAIN.
+The alpha vector and the per-class counts are printed at load time; section 18
+prints the training size and distribution.
 
-`augment_training_data` needed no change: it copies the RR row verbatim, so it
-is shape-agnostic. (It still copies RR unchanged across synthetic duplicates -
-the known defect logged in CLAUDE.md.)
-
-Nothing else changed: no architecture change (the RR branch is still
-`Dense(16)`, verified), no loss, learning-rate, augmentation or split change.
-`DS1_VAL` is still `['207','220','223']`.
+Nothing else changed: no architecture change, no learning-rate value change,
+no RR feature change, no split change. `DS1_VAL` is still
+`['207','220','223']`.
 
 ---
 
-## Step 2 predictions - scorecard
-
-All three passed.
+## Step 3 predictions - scorecard
 
 | # | prediction | outcome |
 |---|---|---|
-| 1 | `best_epoch >= 5`; if it returns 1 the problem is upstream of selection | **PASS** - `best_epoch = 14`, ran 24 epochs, `early_stopping_fired = true` |
-| 2 | `val_per_record` shows record 220 with `support.V = 0`, `recall.V = 0.0` | **PASS** - exactly that |
-| 3 | test macro-F1 beats step 1b's 0.4742 | **PASS** - 0.6800 |
+| 1 | `rr_feature_names` in order; `rr_norm_mean` a 5-list near 1.0 | **PASS** - names exact; mean `[1.0009, 1.0027, 0.9925, 1.0124, 1.0461]`, identical to my local computation |
+| 2 | printed clip table under 1% at either bound | **PASS by construction, not directly observed** - the console print is not captured in the artefacts; `rr_clip` is `[0.2, 3.0]` in config and the same data locally gives 0.1348% of cells. I am marking this as not independently verified from the run output. |
+| 3 | test S recall exceeds 0.1280 | **PASS** - 0.1514 |
 
-Prediction 3 came in higher than I framed it: 0.6800 also clears the
-baseline's 0.6358, which I explicitly declined to predict. Selecting on
-`val_macro_f1` instead of `val_loss` was worth +0.2058 macro-F1 on its own.
+**But macro-F1 regressed 0.6800 -> 0.6645**, and that matters more than
+prediction 3 passing. What actually happened: the S->N leak nearly halved
+(1350 -> 692 of 1836), which is what the ratio features were supposed to do -
+but the freed beats went to **V**, not to S (S->V 251 -> 866). V F1 fell
+0.8718 -> 0.8004. The features carry real prematurity signal; the model is
+spending it on the wrong boundary. That is a class-balancing symptom, which
+is exactly what this step addresses.
 
-**What the instrumentation found.** Record **207** is a severe outlier:
-accuracy 0.1647, N recall 0.0700, S recall 0.0000, while 220 and 223 score
-0.9780 and 0.9602. The model calls almost everything in 207 a V beat (V
-recall 0.9429). One of the three validation records is dragging the selection
-signal, which is precisely the question `val_per_record` was added to answer.
-That is a step 4 conversation, not something I changed here.
+**Your stated condition is recorded in `docs/ablation.md`:** if step 4 does
+not recover macro-F1 above 0.6800, the ratio features get reconsidered.
 
 ---
 
@@ -97,30 +80,58 @@ That is a step 4 conversation, not something I changed here.
 
 **py_compile** - passed, exit code 0.
 
-**AST line-span check** (90 added lines, 4 deleted):
+**`ast.dump` comparison - exactly which functions changed:**
 
-| function | lines (new) | added | deleted | expectation |
-|---|---|---|---|---|
-| `build_model` | 876-1021 | CLEAN | CLEAN | must NOT change |
-| `categorical_focal_loss` | 600-634 | CLEAN | CLEAN | must NOT change |
-| `augment_segment` | 468-510 | CLEAN | CLEAN | must NOT change |
-| `augment_training_data` | 517-593 | CLEAN | CLEAN | must NOT change |
-| `fit_rr_norm` | 264-280 | CLEAN | CLEAN | must NOT change |
-| `apply_rr_norm` | 283-292 | CLEAN | CLEAN | must NOT change |
-| `extract_beats_from_record` | 299-412 | 44 lines | 3 lines | **MAY change** |
+```
+changed  : ['build_model', 'categorical_focal_loss']
+added    : NONE
+removed  : NONE
+unchanged: 10 of 12
+```
 
-Whole-file `ast.dump` comparison against the pre-edit file:
-**`extract_beats_from_record` is the only function that changed.** No
-functions added, none removed.
+Both changes were expected; there are no others. `build_model` changed **only**
+in its `model.compile()` call - `model.compile` lives inside `build_model`, so
+the loss and optimiser edits necessarily land there. The complete diff of that
+function is four lines:
 
-`build_model`'s RR branch still contains `Dense(16, ...)`; the only edit near
-the model is the call-site `rr_shape`.
+```diff
+-            learning_rate=1e-4
++            learning_rate=ADAM_LEARNING_RATE
+-            alpha=0.50,
+-            gamma=2.0
++            alpha=FOCAL_ALPHA,
++            gamma=FOCAL_GAMMA
+```
 
-**Constants unchanged**: `alpha=0.50` (2), `gamma=2.0` (2),
-`learning_rate=1e-4` (1), `multiplier = 6` (1), `PRE_SAMPLES = 90` (1),
-`POST_SAMPLES = 144` (1).
+`Dense(16)` in the RR branch is still present. No layer, unit count, kernel
+size, dropout rate or activation changed.
 
-**Record literals unchanged**:
+**Is `augment_training_data` actually dead?** Checked by AST call-graph, not
+grep - grep is what got this wrong once before. Every `ast.Call` node in the
+file was collected and attributed to the function containing it:
+
+```
+augment_training_data        called from: NOWHERE
+augment_segment              called from: ['augment_training_data']
+extract_beats_from_record    called from: ['load_dataset']
+load_dataset                 called from: ['<module>']
+categorical_focal_loss       called from: ['build_model']
+build_model                  called from: ['<module>']
+fit_rr_norm                  called from: ['<module>']
+apply_rr_norm                called from: ['<module>']
+```
+
+`augment_training_data` has zero call sites, and `augment_segment` is
+reachable only through it, so both are dead. The three `*_tr_aug` names are
+still assigned at module level, so the model still receives data.
+
+**Constants and definitions unchanged:** `PRE_SAMPLES = 90` (1),
+`POST_SAMPLES = 144` (1), `ADAM_LEARNING_RATE = 1e-4` present, the literal
+`alpha=0.50` gone. The five RR feature definitions were compared as a source
+block against the pre-edit file: **identical**, as are `RR_FEATURE_NAMES`,
+`RR_LOCAL_WINDOW = 10`, `RR_CLIP_MIN = 0.2`, `RR_CLIP_MAX = 3.0`.
+
+**Record literals unchanged:**
 
 ```
 DS1      IDENTICAL  sha256 9f20e3ac1758a312...
@@ -128,248 +139,360 @@ DS2      IDENTICAL  sha256 b8a3e6bbdeeec72a...
 DS1_VAL  IDENTICAL  sha256 0d9df3612a6111a1...
 ```
 
-Same hashes as steps 1, 1b and 2.
+Same hashes as steps 1 through 3.
 
-**Behavioural test on real MIT-BIH data.** `extract_beats_from_record`,
-`load_dataset` and `normalize_segment` were lifted out of the edited
-`src/train.py` by AST, so the shipped code is what runs. The five features
-were then recomputed by an independent reference written from your spec
-rather than from the code, and compared element-wise.
+**Numerical verification of the alpha computation.** The derivation block was
+extracted from the shipped source and executed against a label array built to
+the real DS1_TRAIN counts (taken from `tools/ds1_beat_counts.json`, not
+hardcoded), then compared against both your reference values and an
+independent recomputation of the formula.
 
 ```
-feature names (5):
-   1. pre_RR_over_median
-   2. post_RR_over_median
-   3. local_RR_over_median
-   4. pre_RR_over_local
-   5. post_RR_over_pre
-local window 10, clip [0.2, 3.0]
+A) AST call-graph check (not grep - grep missed this once)
+   augment_training_data        called from: NOWHERE
+   augment_segment              called from: ['augment_training_data']
+   extract_beats_from_record    called from: ['load_dataset']
+   load_dataset                 called from: ['<module>']
+   categorical_focal_loss       called from: ['build_model']
+   build_model                  called from: ['<module>']
+   fit_rr_norm                  called from: ['<module>']
+   apply_rr_norm                called from: ['<module>']
 
-A) independent recomputation on record 209
-   beats 3004   rr shape (3004, 5)
-   reference shape (3004, 5)
-   independent recomputation matches shipped code: True -> PASS
-   beats using the median fallback (fewer than 10 preceding intervals): 11
+   augment_training_data is dead: True -> PASS
+   augment_segment only reachable via the dead function: True -> PASS
+   *_tr_aug still assigned at module level: 3 -> PASS
 
-B) clip saturation across all of DS1_TRAIN
-   total beats 44076   feature matrix (44076, 5)
+B) alpha derivation, executed from the shipped source
+   extracted 22 lines of derivation code
+   DS1_TRAIN counts from tools/ds1_beat_counts.json: {'N': 40301, 'S': 670, 'V': 3105}
+   FOCAL_CLASS_COUNTS: [40301, 670, 3105]
+   FOCAL_ALPHA       : [0.2428, 1.8827, 0.8746]
+   sum               : 3.000000
+   [PASS] counts are N/S/V in class-index order
+   [PASS] length 3
+   [PASS] sums to NUM_CLASSES=3
+   [PASS] matches reference [0.2428, 1.8827, 0.8746] to 1e-3
+   [PASS] matches independent recomputation to 1e-6
+   [PASS] rarest class gets the largest weight
+   [PASS] most common class gets the smallest weight
+   [PASS] ordering follows inverse frequency (N < V < S)
 
-   feature                       min      max     mean   median   %at_min   %at_max
-   pre_RR_over_median         0.2000   3.0000   1.0009   1.0000    0.000%    0.005%
-   post_RR_over_median        0.2000   2.4932   1.0027   1.0030    0.000%    0.000%
-   local_RR_over_median       0.3212   1.7618   0.9925   1.0016    0.000%    0.000%
-   pre_RR_over_local          0.2000   3.0000   1.0124   1.0014    0.000%    0.011%
-   post_RR_over_pre           0.2000   3.0000   1.0461   0.9963    0.000%    0.658%
+C) what the change actually does to the loss
+   old: scalar alpha 0.50 applied to every class
+   new: [0.2428, 1.8827, 0.8746]
 
-   values at a clip bound: 297 of 220380 = 0.1348% of all cells
-   beats with >=1 clipped feature: 0.6693%
-   saturating (>5%% of cells at a bound): False -> PASS
+   class     count  old alpha  new alpha ratio new/old
+   N         40301     0.5000     0.2428        0.486x
+   S           670     0.5000     1.8827        3.765x
+   V          3105     0.5000     0.8746        1.749x
 
-C) do the ratios separate S from N the way they should?
-   S beats are premature, so pre_RR_over_local should sit BELOW 1
-   for S and near 1 for N.
+   total loss mass per class (count x copies x alpha):
+   class             old            new     change
+   N             20150.5         9783.1      0.49x
+   S              2345.0         1261.4      0.54x
+   V              4657.5         2715.5      0.58x
 
-   feature                      N mean     S mean     V mean
-   pre_RR_over_median           1.0271     0.6728     0.7323
-   post_RR_over_median          0.9882     0.9386     1.2041
-   local_RR_over_median         0.9933     0.8815     1.0065
-   pre_RR_over_local            1.0377     0.8065     0.7276
-   post_RR_over_pre             0.9874     1.4246     1.7267
+   effective per-beat emphasis vs N (copies x alpha, normalised):
+   S:N   old 7.000x -> new 7.756x   (+10.8%)
+   V:N   old 3.000x -> new 3.603x   (+20.1%)
 
-   S pre_RR/local 0.8065 < N pre_RR/local 1.0377 : True -> PASS
-   best single-threshold S F1 from pre_RR/local alone: 0.1515 (threshold 0.8365)
-   step 2 model achieved S F1 0.1942 on DS2 using all features.
+   mean alpha per sample  old 0.5000 -> new 0.3122  (62% of old)
+   training samples  old (S x7, V x3): 54306 -> 425 steps/epoch @128
+   training samples  new (no oversample): 44076 -> 345 steps/epoch @128
 
 OVERALL: PASS
 ```
 
-Three results worth pulling out:
-
-1. **The independent recomputation matches exactly** on all 3,004 beats x 5
-   features of record 209, to 1e-9. Two implementations from the same spec
-   agreeing is much stronger evidence than the code merely running.
-
-2. **The clip is nowhere near saturating.** Across all 44,076 DS1_TRAIN beats,
-   **0.1348% of feature values** sit at a bound, and **0.6693% of beats** have
-   at least one clipped feature. The worst single feature is
-   `post_RR_over_pre` at 0.658% hitting the upper bound - which is the
-   compensatory pause after an ectopic beat, so it is real signal being
-   bounded, not noise. No feature touches the lower bound at all.
-
-3. **The features separate S from N in the direction the physiology predicts.**
-   `pre_RR_over_median` averages **0.6728** on S beats against **1.0271** on N -
-   S beats arrive early, as they should. `post_RR_over_pre` averages **1.4246**
-   on S against 0.9874 on N - the compensatory pause. As a sanity check on how
-   much signal that is: a single threshold on `pre_RR_over_local` alone reaches
-   **S F1 0.1515**, against the step 2 model's 0.1942 using the whole network
-   and the old raw features.
+`FOCAL_ALPHA = [0.2428, 1.8827, 0.8746]`, matching your reference to four
+decimals and an independent recomputation to 1e-6, summing to exactly 3.
 
 ---
 
-## git diff - extract_beats_from_record
+## The swap is close to weight-neutral - worth knowing before reading the result
 
-```diff
-@@ -307,6 +329,17 @@ def extract_beats_from_record(
-     ann_samples = annotation.sample
-     ann_symbols = annotation.symbol
- 
-+    # Full RR series for this record, computed once.
-+    # rr_series[k] = ann_samples[k + 1] - ann_samples[k], so the interval
-+    # ending at beat i is rr_series[i - 1] and the one starting at beat i
-+    # is rr_series[i].
-+    rr_series = np.diff(ann_samples).astype(np.float64)
-+
-+    median_rr = float(np.median(rr_series)) if len(rr_series) else 0.0
-+
-+    if not np.isfinite(median_rr) or median_rr <= 0.0:
-+        median_rr = 1.0
-+
-     beats = []
-     labels = []
-     rr_features = []@@ -331,10 +364,40 @@ def extract_beats_from_record(
-         if len(segment) != SEGMENT_LENGTH:
-             continue
- 
--        prev_rr = ann_samples[i] - ann_samples[i - 1]
--        next_rr = ann_samples[i + 1] - ann_samples[i]
-+        pre_rr = float(rr_series[i - 1])
-+        post_rr = float(rr_series[i])
-+
-+        # The RR_LOCAL_WINDOW intervals immediately BEFORE this beat's own
-+        # pre_RR: rr_series[i - 1 - W : i - 1]. Excluding pre_RR is what
-+        # makes pre_RR / local_RR a prematurity measure rather than a
-+        # self-comparison. Too few preceding intervals -> fall back to the
-+        # record median.
-+        window_start = i - 1 - RR_LOCAL_WINDOW
-+
-+        if window_start >= 0:
-+            local_rr = float(np.mean(rr_series[window_start:i - 1]))
-+        else:
-+            local_rr = median_rr
-+
-+        if not np.isfinite(local_rr) or local_rr <= 0.0:
-+            local_rr = median_rr
-+
-+        # pre_rr can only be <= 0 with corrupt annotations; fall back so
-+        # feature 5 never divides by zero.
-+        pre_rr_denom = pre_rr if pre_rr > 0.0 else median_rr
-+
-+        rr = [
-+            pre_rr / median_rr,
-+            post_rr / median_rr,
-+            local_rr / median_rr,
-+            pre_rr / local_rr,
-+            post_rr / pre_rr_denom
-+        ]
- 
--        rr = [prev_rr, next_rr]
-+        rr = [
-+            float(np.clip(value, RR_CLIP_MIN, RR_CLIP_MAX))
-+            for value in rr
-+        ]
- 
-         segment = normalize_segment(segment)
- 
-```
+This is the part I would not have predicted, and it changes how step 4's
+outcome should be read.
+
+Old scheme: S got its emphasis from **duplication** (7 copies, each weighted
+0.50). New scheme: S gets it from **alpha** (1 copy, weighted 1.8827). Those
+nearly cancel:
+
+| | S:N emphasis | V:N emphasis |
+|---|---|---|
+| old (copies x alpha) | 7.000x | 3.000x |
+| new (copies x alpha) | 7.756x | 3.603x |
+| change | **+10.8%** | **+20.1%** |
+
+So this step is **not** a large rebalancing toward S. It is mostly a
+*cleaner* rebalancing - the same relative emphasis, achieved without
+fabricating data or duplicating RR vectors.
+
+What does change substantially is the **absolute gradient scale**:
+
+- mean alpha per sample: 0.5000 -> 0.3122 (**62% of before**)
+- samples per epoch: 54,306 -> 44,076 (**425 -> 345 steps/epoch**)
+
+Combined, an epoch now delivers roughly half the loss mass it used to. That
+behaves like a lower learning rate. If step 4 underperforms, "needs more
+epochs" is a live explanation before "the rebalancing failed" - check
+`best_epoch` and whether early stopping fired before concluding anything.
 
 ---
 
 ## Falsifiable predictions for the next Kaggle run
 
-1. **`config.rr_feature_names` will list the five names in the order above,
-   and `rr_norm_mean` / `rr_norm_std` will each be 5-element lists** whose
-   means are all near 1.0 (my local values: 1.0009, 1.0027, 0.9925, 1.0124,
-   1.0461). Any deviation means Kaggle loaded different data.
-2. **The printed clip table will show under 1% at either bound for every
-   feature.** If any feature exceeds 5%, the bounds are wrong and the
-   comparison against step 2 is contaminated.
-3. **Test S recall will exceed step 2's 0.1280.** This is the actual bet.
-   Raw RR was the one input that could not generalise across patients, and S
-   detection depends on it more than N or V do. **If S recall does not move,
-   the RR representation was not the bottleneck** and the next suspect is the
-   6x synthetic oversampling of S with RR copied unchanged - which makes six
-   of every seven S training examples carry identical rhythm context.
+1. **345 steps/epoch** (44,076 samples at batch 128), down from 425.
+   `config.oversampling` will be `false` and `train_distribution` will still
+   read N=40301 / S=670 / V=3105 - that field is computed before the split,
+   so it does not change.
+2. **`config.focal_loss_alpha` will be `[0.2428..., 1.8827..., 0.8746...]`**
+   summing to 3.0, with `focal_alpha_class_counts = [40301, 670, 3105]`.
+3. **S->V misclassification will fall from 866.** The V weight rose only 1.75x
+   against N's 0.49x, so V should stop absorbing S beats. This is the
+   mechanism the step targets.
+4. **macro-F1 will land above step 3's 0.6645.** Whether it clears step 2's
+   0.6800 - your stated condition - I genuinely do not know: the relative
+   rebalancing is only +10.8% for S, so a large jump would surprise me.
 
-I am not predicting macro-F1 will rise. V F1 is already 0.8718 and may give
-back a little as the RR branch changes meaning; the S column is what this
-step targets.
+Prediction 3 is the mechanistic test. Prediction 4 is the decision gate.
+
+---
+
+## git diff
+
+```diff
+diff --git a/src/train.py b/src/train.py
+index 8296cc6..92ad64c 100644
+--- a/src/train.py
++++ b/src/train.py
+@@ -199,6 +199,17 @@ RR_LOCAL_WINDOW = 10
+ RR_CLIP_MIN = 0.2
+ RR_CLIP_MAX = 3.0
+ 
++# Loss settings (step 4).
++# Focal alpha is a PER-CLASS vector, derived at runtime from the DS1_TRAIN
++# counts as (1 / count_c) ** FOCAL_BETA, rescaled to sum to NUM_CLASSES.
++# It was previously the scalar 0.50, which multiplies every class by the
++# same factor and rebalances nothing - it just halved the effective loss.
++FOCAL_BETA = 0.5
++
++FOCAL_GAMMA = 2.0
++
++ADAM_LEARNING_RATE = 1e-4
++
+ LEAD_INDEX = 0
+ 
+ BATCH_SIZE = 128
+@@ -462,9 +473,13 @@ def load_dataset(
+ 
+ 
+ # =========================================================
+-# 9. ECG AUGMENTATION
++# 9. ECG AUGMENTATION  [DEPRECATED - unused since step 4]
+ # =========================================================
+ 
++# DEPRECATED. Not called anywhere. Kept only so earlier runs in
++# docs/ablation.md remain readable against this file. Do not re-enable:
++# synthetic beats violate hard constraint 2 (no data expansion).
++
+ def augment_segment(segment):
+ 
+     x = segment.copy()
+@@ -511,9 +526,14 @@ def augment_segment(segment):
+ 
+ 
+ # =========================================================
+-# 10. TARGETED AUGMENTATION
++# 10. TARGETED AUGMENTATION  [DEPRECATED - unused since step 4]
+ # =========================================================
+ 
++# DEPRECATED. augment_training_data() is no longer called; section 18
++# passes the training arrays straight through. It expanded S x7 / V x3 with
++# duplicated RR vectors, which violates hard constraint 2. Class balancing
++# is done in the loss now (FOCAL_ALPHA). Do not re-enable.
++
+ def augment_training_data(
+     X,
+     RR,
+@@ -598,9 +618,24 @@ def augment_training_data(
+ # =========================================================
+ 
+ def categorical_focal_loss(
+-    alpha=0.50,
++    alpha,
+     gamma=2.0
+ ):
++    """Multiclass focal loss with a PER-CLASS alpha vector.
++
++    alpha must be a sequence of length NUM_CLASSES. y_pred is
++    (batch, n_classes), so a (n_classes,) alpha broadcasts over the class
++    axis and each class gets its own weight.
++
++    alpha is deliberately required, not defaulted: the old signature
++    defaulted to the scalar 0.50, which applied the same factor to all
++    three classes and therefore performed no rebalancing at all.
++    """
++
++    alpha = tf.constant(
++        alpha,
++        dtype=tf.float32
++    )
+ 
+     def loss(y_true, y_pred):
+ 
+@@ -708,6 +743,38 @@ print("\nOriginal Test Distribution:")
+ print(Counter(y_test))
+ 
+ 
++# --- per-class focal alpha, derived from DS1_TRAIN counts only ----------
++# Uses training counts only - no validation or test information.
++
++_train_counts = Counter(y_train)
++
++FOCAL_CLASS_COUNTS = [
++    int(_train_counts[INT_TO_LABEL[_i]])
++    for _i in range(NUM_CLASSES)
++]
++
++_alpha_raw = np.array(
++    [
++        (1.0 / _count) ** FOCAL_BETA if _count > 0 else 0.0
++        for _count in FOCAL_CLASS_COUNTS
++    ],
++    dtype=np.float64
++)
++
++FOCAL_ALPHA = (
++    _alpha_raw * (NUM_CLASSES / _alpha_raw.sum())
++).astype(np.float32)
++
++print(f"\nFocal alpha (per class, beta={FOCAL_BETA}, "
++      f"rescaled to sum {NUM_CLASSES}):")
++
++for _i in range(NUM_CLASSES):
++    print(f"  {INT_TO_LABEL[_i]}: count {FOCAL_CLASS_COUNTS[_i]:>6}  "
++          f"alpha {FOCAL_ALPHA[_i]:.4f}")
++
++print(f"  vector: {FOCAL_ALPHA.tolist()}  (sum {FOCAL_ALPHA.sum():.4f})")
++
++
+ # =========================================================
+ # 13. CLASS DISTRIBUTION PLOT
+ # =========================================================
+@@ -839,14 +906,27 @@ print(f"\nTrain beats: {len(y_tr)}   Validation beats: {len(y_val)}")
+ 
+ 
+ # =========================================================
+-# 18. AUGMENT TRAINING DATA
++# 18. AUGMENT TRAINING DATA (REMOVED - step 4)
+ # =========================================================
+ 
+-X_tr_aug, RR_tr_aug, y_tr_aug = augment_training_data(
+-    X_tr,
+-    RR_tr,
+-    y_tr
+-)
++# Duplicate oversampling is gone. It expanded S x7 and V x3 while copying
++# the RR feature vector UNCHANGED across every copy, so six of every seven
++# S training examples carried identical rhythm context - teaching the model
++# to memorise specific training rhythms instead of the relative-timing
++# rule the step 3 features encode. The np.roll time shift also moved the
++# R-peak off its aligned position. It violated hard constraint 2.
++#
++# Class balancing now happens in the loss instead, via the per-class
++# FOCAL_ALPHA vector derived in section 12.
++#
++# The *_aug names are kept so nothing downstream needs to change.
++
++X_tr_aug = X_tr
++RR_tr_aug = RR_tr
++y_tr_aug = y_tr
++
++print(f"\nTraining samples (no oversampling): {len(y_tr_aug)}")
++print(f"Training distribution: {Counter(y_tr_aug)}")
+ 
+ 
+ # =========================================================
+@@ -1007,12 +1087,12 @@ def build_model(ecg_shape, rr_shape):
+     model.compile(
+ 
+         optimizer=tf.keras.optimizers.Adam(
+-            learning_rate=1e-4
++            learning_rate=ADAM_LEARNING_RATE
+         ),
+ 
+         loss=categorical_focal_loss(
+-            alpha=0.50,
+-            gamma=2.0
++            alpha=FOCAL_ALPHA,
++            gamma=FOCAL_GAMMA
+         ),
+ 
+         metrics=['accuracy']
+@@ -1573,11 +1653,17 @@ metrics = {
+ 
+         "LEAD_INDEX": LEAD_INDEX,
+ 
+-        "focal_loss_alpha": 0.50,
++        "focal_loss_alpha": FOCAL_ALPHA.tolist(),
++
++        "focal_loss_beta": FOCAL_BETA,
++
++        "focal_loss_gamma": FOCAL_GAMMA,
++
++        "focal_alpha_class_counts": FOCAL_CLASS_COUNTS,
+ 
+-        "focal_loss_gamma": 2.0,
++        "oversampling": False,
+ 
+-        "adam_learning_rate": 1e-4,
++        "adam_learning_rate": ADAM_LEARNING_RATE,
+ 
+         "DS1": DS1,
+ 
+```
 
 ---
 
 ## Commit
 
 ```
-1a2509c  step 3: patient-relative RR ratio features
+3b67016  step 4: remove oversampling, per-class focal alpha
 ```
 
 Pushed to `origin/main`. This report lands in a small follow-up commit.
 
 ---
 
-## Tree
-
-```
-.
-├── CLAUDE.md
-├── .gitignore
-├── data/                                   (gitignored, not in repo)
-│   └── mit-bih-arrhythmia-database-1.0.0/
-├── docs/
-│   ├── ablation.md
-│   ├── ds1_beat_counts.txt
-│   └── last_report.md
-├── notebooks/
-│   └── .gitkeep
-├── results/
-│   ├── baseline/metrics.json
-│   ├── step1_patient_val/{history,metrics}.json
-│   ├── step1b_rr_trainstats/{history,metrics}.json
-│   └── step2_macrof1_selection/{history,metrics}.json
-├── src/
-│   └── train.py
-└── tools/
-    ├── ds1_beat_counts.json
-    └── inspect_ds1.py
-```
-
----
-
 ## Problems
 
-1. **This step changes DS2's feature representation too**, in the same way
-   step 1b changed its scaling. That is unavoidable - features must be
-   computed identically on train and test - and it uses only each patient's
-   own signal, never labels, so the inter-patient constraint holds. But it
-   means step 3 versus step 2 is a comparison across a feature-space change,
-   not a pure model change. Same caveat as step 1b, worth the same sentence
-   in the methods section.
+1. **Hard constraint 2 is now satisfied, and CLAUDE.md is out of date.** The
+   "Known facts" entry still says augmentation is active and will be removed
+   "in a later step". That later step is this one. I have not edited CLAUDE.md
+   because you did not ask and it is not part of the commit's stated scope -
+   but it should be updated before the next task, or the next reader will act
+   on a stale fact. Say the word and I will fix it.
 
-2. **I used `rr_shape=(len(RR_FEATURE_NAMES),)` rather than the literal
-   `(5,)` you specified.** Same value, but it cannot silently disagree with
-   the feature list if a later step adds a sixth feature. Flagging it because
-   it is a deviation from the letter of the instruction.
+2. **The two augmentation functions are now genuinely dead code**, kept
+   deliberately at your instruction. Verified dead by call-graph, and marked
+   DEPRECATED in two places. Note this is the same shape of claim I got wrong
+   before, which is why it is AST-verified rather than grepped this time.
 
-3. **Feature 3 is nearly constant and may carry little information.**
-   `local_RR_over_median` has mean 0.9925 and median 1.0016 across DS1_TRAIN,
-   with a much narrower spread than the others (min 0.3212, max 1.7618 -
-   never clipped). It describes the patient's recent rhythm relative to their
-   own median, so by construction it hovers near 1. It is not harmful, and
-   after standardisation its variance is rescaled, but do not expect it to
-   contribute much.
+3. **Effective gradient scale roughly halved** - see the section above. This
+   is a real confound in comparing step 4 against step 3, and it was not
+   flagged in the task. It is a consequence of doing the swap correctly, not
+   an error, but it means step 4 is not a perfectly clean single-variable
+   comparison either.
 
-4. **Record 207 remains a severe validation outlier** (accuracy 0.1647, N
-   recall 0.0700 in step 2). Patient-relative RR may or may not help it; 207
-   is a record with sustained ventricular flutter, so its *median* RR is
-   itself computed over abnormal rhythm. If step 3 does not fix 207, the
-   validation set composition needs revisiting - and note that changing
-   `DS1_VAL` would break comparability with steps 1 through 3, so it is a
-   decision to take deliberately rather than by drift.
+4. **Record 207 is still a severe validation outlier** - step 3 gave accuracy
+   0.1733, N recall 0.0824, S recall 0.0000, essentially unchanged from step
+   2's 0.1647 / 0.0700 / 0.0000. Patient-relative RR did not help it. 207 has
+   sustained ventricular flutter, so its median RR is itself computed over
+   abnormal rhythm - the ratio denominator is unreliable for exactly this
+   record. If step 4 does not move it, the validation set composition is worth
+   a deliberate decision (changing `DS1_VAL` would break comparability with
+   steps 1-4, so it is not a change to make casually).
 
-5. Carried over, unchanged: augmentation still active (S x7, V x3, still
-   violating hard constraint 2, and still copying RR unchanged across
-   duplicates - now more clearly a defect, since the copied RR is what this
-   step just made meaningful); record 114 lead swap still unfixed;
-   `tools/inspect_ds1.py` still writes its JSON into `tools/` and that JSON is
-   now **stale** - it was generated before this change and still describes the
-   old feature set's beat counts (the counts themselves are unaffected);
-   stale root `__pycache__/` still present.
+5. Carried over: record 114 lead swap still unfixed; `tools/inspect_ds1.py`
+   still writes its JSON into `tools/`; stale root `__pycache__/` still
+   present.
