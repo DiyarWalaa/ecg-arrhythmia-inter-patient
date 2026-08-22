@@ -1,7 +1,7 @@
 # Last report
 
-**Task:** step 2 - validation instrumentation and model selection on macro-F1.
-Also: added the step 1 and step 1b runs to `docs/ablation.md`.
+**Task:** step 3 - replace raw RR features with patient-relative ratios.
+Also: added the step 2 run to `docs/ablation.md`.
 
 **Date:** 2026-08-22
 
@@ -9,132 +9,118 @@ Also: added the step 1 and step 1b runs to `docs/ablation.md`.
 
 ## What changed
 
-**Validation instrumentation**
+`extract_beats_from_record` now returns **five dimensionless ratios** instead
+of two raw sample counts.
 
-- New `ValidationMetrics` Keras callback (section 21). At each epoch end it
-  predicts on the validation set and computes macro-F1, per-class F1, recall,
-  precision and support, and the validation confusion matrix.
-- It writes `val_macro_f1` and `val_f1_N` / `val_f1_S` / `val_f1_V` into the
-  `logs` dict, so EarlyStopping, ReduceLROnPlateau and `History` all see them.
-- It prints a compact per-epoch line:
-  `epoch N  val macro-F1 x.xxxx   N-F1 ...  S-F1 ...  V-F1 ...`
-- The callback is **first** in the callbacks list. Keras hands one shared
-  `logs` dict to every callback in `on_epoch_end` in list order, so the
-  metric must be written before the two callbacks that read it.
+Per record, computed once before the beat loop:
 
-**Model selection**
+```python
+rr_series = np.diff(ann_samples)          # interval ending at beat k is rr_series[k-1]
+median_rr = np.median(rr_series)          # falls back to 1.0 if empty or <= 0
+```
 
-- `EarlyStopping`: `monitor='val_macro_f1'`, `mode='max'`, `patience=10`,
-  `restore_best_weights=True`.
-- `ReduceLROnPlateau`: `monitor='val_macro_f1'`, `mode='max'`, `factor=0.5`,
-  `patience=5`, `min_lr=1e-6`.
+Per beat `i`:
 
-**Diagnostics after training** (new section 22B)
+| # | feature | definition |
+|---|---|---|
+| 1 | `pre_RR_over_median` | `pre_RR / median_RR_record` |
+| 2 | `post_RR_over_median` | `post_RR / median_RR_record` |
+| 3 | `local_RR_over_median` | `local_RR / median_RR_record` |
+| 4 | `pre_RR_over_local` | `pre_RR / local_RR` |
+| 5 | `post_RR_over_pre` | `post_RR / pre_RR` |
 
-- `best_epoch` and `best_val_macro_f1`, taken as the argmax over the
-  callback's own per-epoch records.
-- Per-record breakdown over 207 / 220 / 223 separately: beat count, accuracy,
-  macro-F1, and per-class support / recall / precision / F1 plus a confusion
-  matrix. Printed, and written to `metrics.json` under `val_per_record`.
-- To make that possible, DS1_VAL is now loaded **one record at a time** and
-  concatenated, keeping a `val_record_ids` array. Same records, same order,
-  same beats - verified byte-identical to the single call (see Verification).
+`local_RR` is the mean of the `RR_LOCAL_WINDOW = 10` intervals immediately
+**before** this beat's own `pre_RR` - slice `rr_series[i-1-W : i-1]`. Beats
+with fewer than 10 preceding intervals fall back to `median_RR_record`.
 
-**Persistence**
+**On that interpretation:** "the previous 10 RR intervals" excludes the
+beat's own `pre_RR`. That is what makes feature 4 a prematurity measure -
+current interval against recent local rhythm. Including `pre_RR` in its own
+denominator would dilute exactly the signal the feature exists to capture. On
+record 209 the fallback branch is taken by 11 beats.
 
-- `metrics.json` gains `best_epoch`, `best_val_macro_f1`,
-  `early_stopping_fired` and `val_per_record`.
-- `history.json` gains `val_metrics_per_epoch` with the full per-epoch
-  validation record. The scalar `val_macro_f1` and `val_f1_*` series arrive
-  automatically through Keras `History` because the callback wrote them into
-  `logs`.
-- Added `precision_recall_fscore_support` to the existing `sklearn.metrics`
-  import.
+Every feature is clipped to `[0.2, 3.0]` after computation. Division guards:
+`median_rr <= 0` or non-finite falls back to `1.0`; `local_rr <= 0` or
+non-finite falls back to `median_rr`; `pre_rr <= 0` falls back to `median_rr`
+as feature 5's denominator.
 
-**Ablation table** - `docs/ablation.md` now carries step 1 and step 1b, read
-programmatically from their `metrics.json`. Both rows record that
-EarlyStopping restored epoch 1; the step 1b note records that DS2
-preprocessing also changed, so it is not a single-variable comparison against
-the baseline.
+**Downstream**
 
-Nothing else changed: no model architecture, loss, learning rate,
-augmentation, RR feature, or split change. `DS1_VAL` is still
-`['207','220','223']`.
+- `fit_rr_norm` / `apply_rr_norm` unchanged, still fitted on DS1_TRAIN only.
+  Both are already `axis=0` and shape-agnostic, so they went from 2 columns
+  to 5 with no edit.
+- `build_model` call site: `rr_shape=(2,)` -> `rr_shape=(len(RR_FEATURE_NAMES),)`.
+  I used the length of the names list rather than a literal `(5,)` so the two
+  cannot drift apart in a later step. It evaluates to `(5,)` today.
+- New section 3 constants: `RR_FEATURE_NAMES`, `RR_LOCAL_WINDOW = 10`,
+  `RR_CLIP_MIN = 0.2`, `RR_CLIP_MAX = 3.0`.
+- `metrics.json` config gains `rr_feature_names`, plus `rr_local_window` and
+  `rr_clip` so a run's feature definition is fully recoverable from its own
+  metrics file.
+- Section 15 prints min / max / mean / median and the percentage of values
+  sitting at each clip bound, per feature, for DS1_TRAIN.
 
----
+`augment_training_data` needed no change: it copies the RR row verbatim, so it
+is shape-agnostic. (It still copies RR unchanged across synthetic duplicates -
+the known defect logged in CLAUDE.md.)
 
-## Files touched
-
-- `src/train.py` - sklearn import, section 12 (val loading with provenance),
-  section 21 (callback + monitors), new section 22B, metrics block, history
-  block
-- `docs/ablation.md` - regenerated with three rows
-- `results/step1_patient_val/`, `results/step1b_rr_trainstats/` - committed
-- `docs/last_report.md` - this file
+Nothing else changed: no architecture change (the RR branch is still
+`Dense(16)`, verified), no loss, learning-rate, augmentation or split change.
+`DS1_VAL` is still `['207','220','223']`.
 
 ---
 
-## Step 1b predictions - scorecard
+## Step 2 predictions - scorecard
 
-I made three falsifiable predictions last step. The runs are now in, so:
+All three passed.
 
 | # | prediction | outcome |
 |---|---|---|
-| 1 | steps/epoch stays 425 | **PASS** (indirect) - `train_distribution` is exactly N=40301 / S=670 / V=3105 as predicted, which fixes the post-augmentation count at 54,306 = 425 steps |
-| 2 | prints mean `[274.881103515625, 275.1480712890625]`, std `[77.20227813720703, 75.38490295410156]` | **PASS** - `config.rr_norm_mean` and `config.rr_norm_std` match to all 16 digits |
-| 3 | val_accuracy clears 0.8528 | **FAIL** - peaked at 0.7390, up only 0.0022 from step 1's 0.7368 |
+| 1 | `best_epoch >= 5`; if it returns 1 the problem is upstream of selection | **PASS** - `best_epoch = 14`, ran 24 epochs, `early_stopping_fired = true` |
+| 2 | `val_per_record` shows record 220 with `support.V = 0`, `recall.V = 0.0` | **PASS** - exactly that |
+| 3 | test macro-F1 beats step 1b's 0.4742 | **PASS** - 0.6800 |
 
-**Prediction 3 failing matters more than the other two passing.** I argued the
-RR scale mismatch was why validation sat below trivial. It was a real defect
-and fixing it was correct, but it was **not** the cause: removing a 20.5%
-scale error moved peak val_accuracy by 0.002. The below-trivial validation
-performance has a different source, and step 2's per-record and per-class
-instrumentation exists precisely to find it. Current suspects, in order:
-the model over-predicting V (augmentation gives V x3 and focal loss pushes
-minority recall), and the record 114 lead swap.
+Prediction 3 came in higher than I framed it: 0.6800 also clears the
+baseline's 0.6358, which I explicitly declined to predict. Selecting on
+`val_macro_f1` instead of `val_loss` was worth +0.2058 macro-F1 on its own.
+
+**What the instrumentation found.** Record **207** is a severe outlier:
+accuracy 0.1647, N recall 0.0700, S recall 0.0000, while 220 and 223 score
+0.9780 and 0.9602. The model calls almost everything in 207 a V beat (V
+recall 0.9429). One of the three validation records is dragging the selection
+signal, which is precisely the question `val_per_record` was added to answer.
+That is a step 4 conversation, not something I changed here.
 
 ---
 
 ## Verification
 
-**py_compile**
+**py_compile** - passed, exit code 0.
 
-```
-$ python -m py_compile src/train.py
-$ echo $?
-0
-```
+**AST line-span check** (90 added lines, 4 deleted):
 
-**No changed line inside a protected function** (AST line-span method, both
-sides of the diff - 262 added, 20 deleted):
+| function | lines (new) | added | deleted | expectation |
+|---|---|---|---|---|
+| `build_model` | 876-1021 | CLEAN | CLEAN | must NOT change |
+| `categorical_focal_loss` | 600-634 | CLEAN | CLEAN | must NOT change |
+| `augment_segment` | 468-510 | CLEAN | CLEAN | must NOT change |
+| `augment_training_data` | 517-593 | CLEAN | CLEAN | must NOT change |
+| `fit_rr_norm` | 264-280 | CLEAN | CLEAN | must NOT change |
+| `apply_rr_norm` | 283-292 | CLEAN | CLEAN | must NOT change |
+| `extract_beats_from_record` | 299-412 | 44 lines | 3 lines | **MAY change** |
 
-| function | lines (new) | added-side | deleted-side |
-|---|---|---|---|
-| `build_model` | 796-941 | CLEAN | CLEAN |
-| `categorical_focal_loss` | 537-571 | CLEAN | CLEAN |
-| `augment_segment` | 405-447 | CLEAN | CLEAN |
-| `augment_training_data` | 454-530 | CLEAN | CLEAN |
-| `extract_beats_from_record` | 277-349 | CLEAN | CLEAN |
-| `fit_rr_norm` | 242-258 | CLEAN | CLEAN |
-| `apply_rr_norm` | 261-270 | CLEAN | CLEAN |
+Whole-file `ast.dump` comparison against the pre-edit file:
+**`extract_beats_from_record` is the only function that changed.** No
+functions added, none removed.
 
-Stronger check, since line spans alone can miss a same-line edit: every
-function present in both versions was compared by `ast.dump`. **Zero
-pre-existing functions changed.** The only functions added are `__init__` and
-`on_epoch_end`, the two methods of the new callback class.
+`build_model`'s RR branch still contains `Dense(16, ...)`; the only edit near
+the model is the call-site `rr_shape`.
 
-**Constants unchanged**
+**Constants unchanged**: `alpha=0.50` (2), `gamma=2.0` (2),
+`learning_rate=1e-4` (1), `multiplier = 6` (1), `PRE_SAMPLES = 90` (1),
+`POST_SAMPLES = 144` (1).
 
-| constant | occurrences |
-|---|---|
-| `alpha=0.50` | 2 |
-| `gamma=2.0` | 2 |
-| `learning_rate=1e-4` | 1 |
-| `multiplier = 6` | 1 |
-| `PRE_SAMPLES = 90` | 1 |
-| `POST_SAMPLES = 144` | 1 |
-
-**Record literals unchanged**
+**Record literals unchanged**:
 
 ```
 DS1      IDENTICAL  sha256 9f20e3ac1758a312...
@@ -142,108 +128,178 @@ DS2      IDENTICAL  sha256 b8a3e6bbdeeec72a...
 DS1_VAL  IDENTICAL  sha256 0d9df3612a6111a1...
 ```
 
-Same hashes as steps 1 and 1b.
+Same hashes as steps 1, 1b and 2.
 
-**Behavioural test without TensorFlow.** `load_dataset`,
-`extract_beats_from_record`, `normalize_segment` and the `ValidationMetrics`
-class were lifted out of the edited `src/train.py` by AST - so the test
-exercises the shipped code - and run against the real MIT-BIH records with a
-stubbed `tf.keras.callbacks.Callback` and a fake model.
-
-`scikit-learn` is not installed on this machine (CLAUDE.md: tools need only
-wfdb + numpy), so `precision_recall_fscore_support` and `confusion_matrix`
-were replaced with numpy reference implementations matching sklearn's
-`average=None` semantics. The test therefore validates **my** aggregation and
-plumbing, not sklearn's arithmetic. I did not install packages into your
-environment to get around this.
+**Behavioural test on real MIT-BIH data.** `extract_beats_from_record`,
+`load_dataset` and `normalize_segment` were lifted out of the edited
+`src/train.py` by AST, so the shipped code is what runs. The five features
+were then recomputed by an independent reference written from your spec
+rather than from the code, and compared element-wise.
 
 ```
-A) per-record load vs single load_dataset(DS1_VAL)
-Loading record 207 ...
-Loading record 220 ...
-Loading record 223 ...
-Loading record 207 ...
-Loading record 220 ...
-Loading record 223 ...
-   shapes single (6494, 234)  per-record (6494, 234)
-   arrays byte-identical: True -> PASS
-   record ids length 6494 == beats 6494 : True
-     207 -> 1858 beats
-     220 -> 2046 beats
-     223 -> 2590 beats
+feature names (5):
+   1. pre_RR_over_median
+   2. post_RR_over_median
+   3. local_RR_over_median
+   4. pre_RR_over_local
+   5. post_RR_over_pre
+local window 10, clip [0.2, 3.0]
 
-B) ValidationMetrics callback
-   class lifted from src/train.py OK
-  epoch   1  val macro-F1 0.2367   N-F1 0.4912  S-F1 0.0680  V-F1 0.1510
-  epoch   1  val macro-F1 0.3068   N-F1 0.9205  S-F1 0.0000  V-F1 0.0000
-   all-N model: macro-F1 0.3068 vs accuracy 0.8528
-   [PASS] val_macro_f1 in logs
-   [PASS] val_macro_f1 correct
-   [PASS] macro-F1 == mean of 3 per-class F1
-   [PASS] val_f1_N in logs & correct
-   [PASS] val_f1_S in logs & correct
-   [PASS] val_f1_V in logs & correct
-   [PASS] pre-existing log keys preserved
-   [PASS] records has 1 entry, epoch 1-based
-   [PASS] record key val_macro_f1
-   [PASS] record key val_f1
-   [PASS] record key val_recall
-   [PASS] record key val_precision
-   [PASS] record key val_support
-   [PASS] record key val_confusion_matrix
-   [PASS] recall matches sklearn
-   [PASS] precision matches sklearn
-   [PASS] support sums to n beats
-   [PASS] confusion matrix 3x3 and sums to n
-   [PASS] all-N degenerate: no crash, S/V F1 == 0
-   [PASS] all-N macro-F1 < all-N accuracy (the whole point)
+A) independent recomputation on record 209
+   beats 3004   rr shape (3004, 5)
+   reference shape (3004, 5)
+   independent recomputation matches shipped code: True -> PASS
+   beats using the median fallback (fewer than 10 preceding intervals): 11
 
-C) per-record breakdown logic
-   record 207:  1858 beats  support {'N': 1542, 'S': 106, 'V': 210}
-   record 220:  2046 beats  support {'N': 1952, 'S': 94, 'V': 0}
-   record 223:  2590 beats  support {'N': 2044, 'S': 73, 'V': 473}
-   masks partition the val set exactly: True -> PASS
-   per-record supports sum to val totals {'N': 5538, 'S': 273, 'V': 683} == {'V': 683, 'N': 5538, 'S': 273} : True -> PASS
+B) clip saturation across all of DS1_TRAIN
+   total beats 44076   feature matrix (44076, 5)
+
+   feature                       min      max     mean   median   %at_min   %at_max
+   pre_RR_over_median         0.2000   3.0000   1.0009   1.0000    0.000%    0.005%
+   post_RR_over_median        0.2000   2.4932   1.0027   1.0030    0.000%    0.000%
+   local_RR_over_median       0.3212   1.7618   0.9925   1.0016    0.000%    0.000%
+   pre_RR_over_local          0.2000   3.0000   1.0124   1.0014    0.000%    0.011%
+   post_RR_over_pre           0.2000   3.0000   1.0461   0.9963    0.000%    0.658%
+
+   values at a clip bound: 297 of 220380 = 0.1348% of all cells
+   beats with >=1 clipped feature: 0.6693%
+   saturating (>5%% of cells at a bound): False -> PASS
+
+C) do the ratios separate S from N the way they should?
+   S beats are premature, so pre_RR_over_local should sit BELOW 1
+   for S and near 1 for N.
+
+   feature                      N mean     S mean     V mean
+   pre_RR_over_median           1.0271     0.6728     0.7323
+   post_RR_over_median          0.9882     0.9386     1.2041
+   local_RR_over_median         0.9933     0.8815     1.0065
+   pre_RR_over_local            1.0377     0.8065     0.7276
+   post_RR_over_pre             0.9874     1.4246     1.7267
+
+   S pre_RR/local 0.8065 < N pre_RR/local 1.0377 : True -> PASS
+   best single-threshold S F1 from pre_RR/local alone: 0.1515 (threshold 0.8365)
+   step 2 model achieved S F1 0.1942 on DS2 using all features.
 
 OVERALL: PASS
 ```
 
-Three things worth pulling out of that output:
+Three results worth pulling out:
 
-- **Per-record loading is byte-identical** to `load_dataset(DS1_VAL, ...)` for
-  X, y and RR. The provenance tracking changes nothing about the data.
-- **Per-record supports match `docs/ds1_beat_counts.txt` exactly** (207:
-  1542/106/210, 220: 1952/94/0, 223: 2044/73/473), an independent
-  cross-check that the masks are correct.
-- **On an all-N model the new metric reads macro-F1 0.3068 while accuracy
-  reads 0.8528.** That gap is the entire justification for the change: the
-  old signal rewards ignoring S, the new one does not.
+1. **The independent recomputation matches exactly** on all 3,004 beats x 5
+   features of record 209, to 1e-9. Two implementations from the same spec
+   agreeing is much stronger evidence than the code merely running.
 
-**Falsifiable predictions for the next Kaggle run**
+2. **The clip is nowhere near saturating.** Across all 44,076 DS1_TRAIN beats,
+   **0.1348% of feature values** sit at a bound, and **0.6693% of beats** have
+   at least one clipped feature. The worst single feature is
+   `post_RR_over_pre` at 0.658% hitting the upper bound - which is the
+   compensatory pause after an ectopic beat, so it is real signal being
+   bounded, not noise. No feature touches the lower bound at all.
 
-1. **The run trains past epoch 8.** Under `val_macro_f1` with `patience=10`,
-   epoch 1 is no longer the best epoch - epoch 1's val macro-F1 is low because
-   the model is near all-N at that point. I expect `best_epoch >= 5` and
-   `early_stopping_fired` either false (ran all 40) or with
-   `stopped_epoch > 15`. **If `best_epoch` comes back as 1 again, selecting on
-   macro-F1 did not change the outcome and the problem is upstream of model
-   selection.**
-2. **`val_per_record` will show record 220 with `support.V = 0`** and
-   therefore `recall.V = 0.0`, because 220 genuinely contains no V beats.
-   That is a display artefact, not a model failure - see Problems.
-3. **Test macro-F1 will exceed step 1b's 0.4742**, because the evaluated model
-   will have trained for more than one epoch. I am *not* predicting it beats
-   the baseline's 0.6358: the baseline had a leaked validation split and the
-   full 22-record training pool, so it is not a fair target.
+3. **The features separate S from N in the direction the physiology predicts.**
+   `pre_RR_over_median` averages **0.6728** on S beats against **1.0271** on N -
+   S beats arrive early, as they should. `post_RR_over_pre` averages **1.4246**
+   on S against 0.9874 on N - the compensatory pause. As a sanity check on how
+   much signal that is: a single threshold on `pre_RR_over_local` alone reaches
+   **S F1 0.1515**, against the step 2 model's 0.1942 using the whole network
+   and the old raw features.
 
-Prediction 1 is the real test of step 2.
+---
+
+## git diff - extract_beats_from_record
+
+```diff
+@@ -307,6 +329,17 @@ def extract_beats_from_record(
+     ann_samples = annotation.sample
+     ann_symbols = annotation.symbol
+ 
++    # Full RR series for this record, computed once.
++    # rr_series[k] = ann_samples[k + 1] - ann_samples[k], so the interval
++    # ending at beat i is rr_series[i - 1] and the one starting at beat i
++    # is rr_series[i].
++    rr_series = np.diff(ann_samples).astype(np.float64)
++
++    median_rr = float(np.median(rr_series)) if len(rr_series) else 0.0
++
++    if not np.isfinite(median_rr) or median_rr <= 0.0:
++        median_rr = 1.0
++
+     beats = []
+     labels = []
+     rr_features = []@@ -331,10 +364,40 @@ def extract_beats_from_record(
+         if len(segment) != SEGMENT_LENGTH:
+             continue
+ 
+-        prev_rr = ann_samples[i] - ann_samples[i - 1]
+-        next_rr = ann_samples[i + 1] - ann_samples[i]
++        pre_rr = float(rr_series[i - 1])
++        post_rr = float(rr_series[i])
++
++        # The RR_LOCAL_WINDOW intervals immediately BEFORE this beat's own
++        # pre_RR: rr_series[i - 1 - W : i - 1]. Excluding pre_RR is what
++        # makes pre_RR / local_RR a prematurity measure rather than a
++        # self-comparison. Too few preceding intervals -> fall back to the
++        # record median.
++        window_start = i - 1 - RR_LOCAL_WINDOW
++
++        if window_start >= 0:
++            local_rr = float(np.mean(rr_series[window_start:i - 1]))
++        else:
++            local_rr = median_rr
++
++        if not np.isfinite(local_rr) or local_rr <= 0.0:
++            local_rr = median_rr
++
++        # pre_rr can only be <= 0 with corrupt annotations; fall back so
++        # feature 5 never divides by zero.
++        pre_rr_denom = pre_rr if pre_rr > 0.0 else median_rr
++
++        rr = [
++            pre_rr / median_rr,
++            post_rr / median_rr,
++            local_rr / median_rr,
++            pre_rr / local_rr,
++            post_rr / pre_rr_denom
++        ]
+ 
+-        rr = [prev_rr, next_rr]
++        rr = [
++            float(np.clip(value, RR_CLIP_MIN, RR_CLIP_MAX))
++            for value in rr
++        ]
+ 
+         segment = normalize_segment(segment)
+ 
+```
+
+---
+
+## Falsifiable predictions for the next Kaggle run
+
+1. **`config.rr_feature_names` will list the five names in the order above,
+   and `rr_norm_mean` / `rr_norm_std` will each be 5-element lists** whose
+   means are all near 1.0 (my local values: 1.0009, 1.0027, 0.9925, 1.0124,
+   1.0461). Any deviation means Kaggle loaded different data.
+2. **The printed clip table will show under 1% at either bound for every
+   feature.** If any feature exceeds 5%, the bounds are wrong and the
+   comparison against step 2 is contaminated.
+3. **Test S recall will exceed step 2's 0.1280.** This is the actual bet.
+   Raw RR was the one input that could not generalise across patients, and S
+   detection depends on it more than N or V do. **If S recall does not move,
+   the RR representation was not the bottleneck** and the next suspect is the
+   6x synthetic oversampling of S with RR copied unchanged - which makes six
+   of every seven S training examples carry identical rhythm context.
+
+I am not predicting macro-F1 will rise. V F1 is already 0.8718 and may give
+back a little as the RR branch changes meaning; the S column is what this
+step targets.
 
 ---
 
 ## Commit
 
 ```
-5c1b9d6  step 2: validation instrumentation, select on macro-F1
+1a2509c  step 3: patient-relative RR ratio features
 ```
 
 Pushed to `origin/main`. This report lands in a small follow-up commit.
@@ -265,14 +321,10 @@ Pushed to `origin/main`. This report lands in a small follow-up commit.
 ├── notebooks/
 │   └── .gitkeep
 ├── results/
-│   ├── baseline/
-│   │   └── metrics.json
-│   ├── step1_patient_val/
-│   │   ├── history.json
-│   │   └── metrics.json
-│   └── step1b_rr_trainstats/
-│       ├── history.json
-│       └── metrics.json
+│   ├── baseline/metrics.json
+│   ├── step1_patient_val/{history,metrics}.json
+│   ├── step1b_rr_trainstats/{history,metrics}.json
+│   └── step2_macrof1_selection/{history,metrics}.json
 ├── src/
 │   └── train.py
 └── tools/
@@ -284,38 +336,40 @@ Pushed to `origin/main`. This report lands in a small follow-up commit.
 
 ## Problems
 
-1. **Record 220 has zero V beats**, so its per-record V recall will always
-   print `0.0000` with `support 0`. That is `zero_division=0` doing its job,
-   not the model failing on 220. Read `support` before reading `recall` in
-   `val_per_record`. Worth knowing before this table gets read as evidence.
+1. **This step changes DS2's feature representation too**, in the same way
+   step 1b changed its scaling. That is unavoidable - features must be
+   computed identically on train and test - and it uses only each patient's
+   own signal, never labels, so the inter-patient constraint holds. But it
+   means step 3 versus step 2 is a comparison across a feature-space change,
+   not a pure model change. Same caveat as step 1b, worth the same sentence
+   in the methods section.
 
-2. **`restore_best_weights` does not always restore.** In Keras, EarlyStopping
-   restores the best weights only when it actually fires; if training reaches
-   the final epoch the last epoch's weights are kept. With `patience=10` and
-   `EPOCHS=40` that is now a live possibility. I did not change the behaviour,
-   but I added `early_stopping_fired` to `metrics.json` and a printed warning
-   so `best_epoch` is never silently mistaken for "the epoch that was
-   evaluated". This is one field beyond your list of seven - flagging it as an
-   addition rather than burying it.
+2. **I used `rr_shape=(len(RR_FEATURE_NAMES),)` rather than the literal
+   `(5,)` you specified.** Same value, but it cannot silently disagree with
+   the feature list if a later step adds a sixth feature. Flagging it because
+   it is a deviation from the letter of the instruction.
 
-3. **The callback adds a full validation forward pass per epoch.** DS1_VAL is
-   6,494 beats against 54,306 training samples, so roughly 12% more inference
-   work per epoch on top of the validation pass Keras already runs. Expect
-   epochs to be modestly slower. Not a correctness issue, but it is real cost.
+3. **Feature 3 is nearly constant and may carry little information.**
+   `local_RR_over_median` has mean 0.9925 and median 1.0016 across DS1_TRAIN,
+   with a much narrower spread than the others (min 0.3212, max 1.7618 -
+   never clipped). It describes the patient's recent rhythm relative to their
+   own median, so by construction it hovers near 1. It is not harmful, and
+   after standardisation its variance is rescaled, but do not expect it to
+   contribute much.
 
-4. **`best_epoch` is computed from the callback's records, not read back out
-   of EarlyStopping.** They should agree, since both take the argmax of the
-   same `val_macro_f1` series. If a future run shows them disagreeing, trust
-   EarlyStopping and treat it as a bug in section 22B.
+4. **Record 207 remains a severe validation outlier** (accuracy 0.1647, N
+   recall 0.0700 in step 2). Patient-relative RR may or may not help it; 207
+   is a record with sustained ventricular flutter, so its *median* RR is
+   itself computed over abnormal rhythm. If step 3 does not fix 207, the
+   validation set composition needs revisiting - and note that changing
+   `DS1_VAL` would break comparability with steps 1 through 3, so it is a
+   decision to take deliberately rather than by drift.
 
-5. **Steps 1 and 1b are not clean comparisons and the table now says so.**
-   Both evaluated one-epoch models, so their macro-F1 drop measures the
-   `val_loss` selection failure, not the split or the RR fix. Step 1b
-   additionally changed DS2 preprocessing. The first genuinely comparable
-   number will come from the next run.
-
-6. Carried over, unchanged: augmentation still active (S x7, V x3, still
-   violating hard constraint 2); record 114 lead swap still unfixed and now
-   the leading suspect for the below-trivial validation;
-   `tools/inspect_ds1.py` still writes its JSON into `tools/`; stale root
-   `__pycache__/` still present.
+5. Carried over, unchanged: augmentation still active (S x7, V x3, still
+   violating hard constraint 2, and still copying RR unchanged across
+   duplicates - now more clearly a defect, since the copied RR is what this
+   step just made meaningful); record 114 lead swap still unfixed;
+   `tools/inspect_ds1.py` still writes its JSON into `tools/` and that JSON is
+   now **stale** - it was generated before this change and still describes the
+   old feature set's beat counts (the counts themselves are unaffected);
+   stale root `__pycache__/` still present.
