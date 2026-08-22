@@ -61,8 +61,6 @@ from sklearn.metrics import (
     precision_recall_curve
 )
 
-from sklearn.model_selection import train_test_split
-
 from sklearn.preprocessing import label_binarize
 
 
@@ -157,6 +155,21 @@ DS2 = [
     '200', '202', '210', '212', '213', '214', '219', '221',
     '222', '228', '231', '232', '233', '234'
 ]
+
+# Patient-wise validation split (step 1).
+# Whole records are held out of training, never individual beats, so no
+# patient can appear on both sides. 207 / 220 / 223 are chosen because
+# they carry enough S beats (106 / 94 / 73) for val S-F1 to be a usable
+# selection signal. Record 201 is deliberately NOT used here: it is the
+# same subject as 202, which lives in DS2.
+DS1_VAL = ['207', '220', '223']
+
+DS1_TRAIN = [rec for rec in DS1 if rec not in DS1_VAL]
+
+# Guard the hard constraint: validation comes from DS1 only, never DS2.
+assert set(DS1_VAL).issubset(set(DS1)), "DS1_VAL must be a subset of DS1"
+assert not set(DS1_VAL) & set(DS2), "DS1_VAL must never contain a DS2 record"
+assert len(DS1_TRAIN) + len(DS1_VAL) == len(DS1)
 
 PRE_SAMPLES = 90
 POST_SAMPLES = 144
@@ -543,10 +556,20 @@ def categorical_focal_loss(
 # 12. LOAD TRAIN / TEST
 # =========================================================
 
-print("Loading DS1 (train) ...")
+print("Loading DS1_TRAIN (train) ...")
 
 X_train, y_train, RR_train = load_dataset(
-    DS1,
+    DS1_TRAIN,
+    DATA_DIR,
+    PRE_SAMPLES,
+    POST_SAMPLES,
+    LEAD_INDEX
+)
+
+print("\nLoading DS1_VAL (validation) ...")
+
+X_valid, y_valid, RR_valid = load_dataset(
+    DS1_VAL,
     DATA_DIR,
     PRE_SAMPLES,
     POST_SAMPLES,
@@ -564,10 +587,16 @@ X_test, y_test, RR_test = load_dataset(
 )
 
 print("\nTrain shape:", X_train.shape)
+print("Val shape  :", X_valid.shape)
 print("Test shape :", X_test.shape)
 
-print("\nOriginal Train Distribution:")
+print(f"\nDS1_TRAIN records ({len(DS1_TRAIN)}): {DS1_TRAIN}")
+print("Original Train Distribution:")
 print(Counter(y_train))
+
+print(f"\nDS1_VAL records ({len(DS1_VAL)}): {DS1_VAL}")
+print("Original Validation Distribution:")
+print(Counter(y_valid))
 
 print("\nOriginal Test Distribution:")
 print(Counter(y_test))
@@ -611,6 +640,11 @@ y_train_encoded = np.array([
     for label in y_train
 ], dtype=np.int32)
 
+y_valid_encoded = np.array([
+    LABEL_TO_INT[label]
+    for label in y_valid
+], dtype=np.int32)
+
 y_test_encoded = np.array([
     LABEL_TO_INT[label]
     for label in y_test
@@ -622,6 +656,7 @@ y_test_encoded = np.array([
 # =========================================================
 
 RR_train = normalize_rr(RR_train)
+RR_valid = normalize_rr(RR_valid)
 RR_test = normalize_rr(RR_test)
 
 
@@ -634,6 +669,11 @@ X_train = np.expand_dims(
     axis=-1
 )
 
+X_valid = np.expand_dims(
+    X_valid,
+    axis=-1
+)
+
 X_test = np.expand_dims(
     X_test,
     axis=-1
@@ -641,29 +681,27 @@ X_test = np.expand_dims(
 
 
 # =========================================================
-# 17. TRAIN / VALIDATION SPLIT
+# 17. TRAIN / VALIDATION SPLIT (patient-wise)
 # =========================================================
 
-(
-    X_tr,
-    X_val,
-    RR_tr,
-    RR_val,
-    y_tr,
-    y_val
+# The split already happened at load time, by record: DS1_TRAIN and
+# DS1_VAL were read as two separate datasets, so there is nothing to
+# slice here and no beat from a validation patient can reach training.
+#
+# This previously used a stratified beat-level train_test_split over all
+# of DS1, which put the same patient on both sides. Validation accuracy
+# reached 0.9885 against a true DS2 accuracy of 0.9294, and EarlyStopping
+# with restore_best_weights selected the final model on that leaked score.
 
-) = train_test_split(
+X_tr = X_train
+RR_tr = RR_train
+y_tr = y_train_encoded
 
-    X_train,
-    RR_train,
-    y_train_encoded,
+X_val = X_valid
+RR_val = RR_valid
+y_val = y_valid_encoded
 
-    test_size=0.1,
-
-    random_state=SEED,
-
-    stratify=y_train_encoded
-)
+print(f"\nTrain beats: {len(y_tr)}   Validation beats: {len(y_val)}")
 
 
 # =========================================================
@@ -1205,7 +1243,11 @@ metrics = {
 
         "DS1": DS1,
 
-        "DS2": DS2
+        "DS2": DS2,
+
+        "ds1_train": DS1_TRAIN,
+
+        "ds1_val": DS1_VAL
     },
 
     "train_distribution": {
