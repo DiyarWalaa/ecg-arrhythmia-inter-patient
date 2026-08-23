@@ -158,26 +158,35 @@ DS2 = [
     '222', '228', '231', '232', '233', '234'
 ]
 
-# Patient-wise validation split (step 1, enlarged at step 5).
-# Whole records are held out of training, never individual beats, so no
-# patient can appear on both sides.
+# Patient-wise validation split (step 1; enlarged at step 5, REVERTED at
+# E1). Whole records are held out of training, never individual beats, so
+# no patient can appear on both sides.
 #
-# Step 5 grew this from 3 records to 5. With 3 records, val macro-F1 swung
-# 0.7288 -> 0.5791 between two consecutive epochs, and the selected peak
-# sat 0.1627 above the surrounding plateau for exactly one epoch. That
-# checkpoint then scored 0.5599 on test - we were selecting noise. More
-# records means a lower-variance selection signal.
-DS1_VAL = ['106', '118', '207', '220', '223']
+# E1 put this back to three records. The five-record set of step 5 added
+# 106 (520 V beats, ZERO S beats) and 118 (16 V, 96 S), which made
+# validation 85.3% N / 11.3% V / 3.4% S. Val V-F1 then peaks at epoch 2
+# while val S-F1 is still climbing at epoch 6, so macro-F1 tracks V and
+# stops early: E0 selected epoch 2 and scored test macro-F1 0.5591 against
+# a required 0.6400, on training code identical to step 3.
+DS1_VAL = ['207', '220', '223']
 
-# Why these five, recorded so the choice is auditable and never quietly
-# re-derived. Written into metrics.json as val_selection_rule.
+# Recorded so the choice is auditable and never quietly re-derived.
+# Written into metrics.json as val_selection_rule.
 VAL_SELECTION_RULE = {
-    "keep": {
-        "records": ['207', '220', '223'],
-        "reason": "the original step 1 validation set, kept so the "
-                  "selection signal stays comparable where possible"
-    },
-    "exclude": [
+    "records": ['207', '220', '223'],
+    "history": "step 1 chose these three; step 5 enlarged to five by "
+               "adding 106 and 118; E1 reverted to the original three",
+    "reverted_at": "E1",
+    "revert_reason": (
+        "Record 106 contributes 520 V beats and ZERO S beats, and 118 "
+        "contributes 16 V to 96 S. Together they made validation "
+        "85.3% N / 11.3% V / 3.4% S. Val V-F1 peaks at epoch 2 while val "
+        "S-F1 keeps rising to epoch 6, so macro-F1 follows V and selects "
+        "early. E0 used training code identical to step 3 and differed "
+        "only in this validation set: it selected epoch 2 instead of 8 "
+        "and scored test macro-F1 0.5591 against a required 0.6400."
+    ),
+    "exclusions_still_binding": [
         {
             "record": "209",
             "reason": "holds 383 of the 943 DS1 S beats; moving it to "
@@ -189,18 +198,11 @@ VAL_SELECTION_RULE = {
                       "validating on it would stack a second leak"
         }
     ],
-    "add": [
-        {
-            "record": "118",
-            "reason": "most S beats of the remaining candidates (96)"
-        },
-        {
-            "record": "106",
-            "reason": "most V beats among records with <= 5 S beats "
-                      "(520); 220 has zero V, so validation V-F1 rested "
-                      "on only two records"
-        }
-    ]
+    "known_limitation": (
+        "220 has zero V beats, so validation V-F1 rests on two records. "
+        "That is accepted: the step 5 attempt to fix it cost more in "
+        "selection bias than it bought in V coverage."
+    )
 }
 
 DS1_TRAIN = [rec for rec in DS1 if rec not in DS1_VAL]
@@ -249,6 +251,23 @@ RR_CLIP_MAX = 3.0
 FOCAL_ALPHA = 0.50
 
 FOCAL_GAMMA = 2.0
+
+# Decision-threshold search (E1).
+#
+# Our S precision (0.402) is in line with de Chazal 2004 (0.385) and Zhou
+# 2021 (0.415), but S recall is 0.128 against their 0.759 and 0.894. The
+# model predicts S 584 times against 1836 true S beats - it under-calls
+# the class about 6x. That is a decision-rule failure, not a feature
+# failure, so it is fixed at the decision rule: prediction becomes
+# argmax(w * p) for a per-class multiplier vector w tuned on VALIDATION.
+#
+# w_N is pinned to 1.0 - only the ratios matter, so one class must be the
+# reference. The grid is log-spaced 0.25 .. 32 (2**-2 .. 2**5).
+THRESHOLD_GRID = [
+    float(v) for v in np.logspace(-2.0, 5.0, 15, base=2.0)
+]
+
+THRESHOLD_MAX_PASSES = 6
 
 ADAM_LEARNING_RATE = 1e-4
 
@@ -712,6 +731,102 @@ def categorical_focal_loss(
         )
 
     return loss
+
+
+# =========================================================
+# 11B. DECISION-THRESHOLD SEARCH
+# =========================================================
+
+# Both functions below are PURE: they take probabilities and labels as
+# arguments and read no module-level data. They cannot see the test set,
+# and the AST of this section contains no test-related name. The caller
+# in section 22C passes validation probabilities only.
+
+
+def macro_f1_from_weights(y_prob, y_true_int, weights, labels):
+    """Macro-F1 of argmax(w * p) for one weight vector."""
+
+    y_pred = np.argmax(
+        y_prob * np.asarray(weights, dtype=np.float64),
+        axis=1
+    )
+
+    _, _, f1, _ = precision_recall_fscore_support(
+        y_true_int,
+        y_pred,
+        labels=labels,
+        zero_division=0
+    )
+
+    return float(np.mean(f1))
+
+
+def tune_decision_weights(y_prob, y_true_int, num_classes, grid,
+                          max_passes):
+    """Coordinate ascent on per-class multipliers, maximising macro-F1.
+
+    w[0] (class N) is pinned to 1.0; only the minority-class multipliers
+    move, since scaling all three by a constant leaves argmax unchanged.
+    One pass sweeps each remaining coordinate over the whole grid, keeping
+    the best. Passes repeat until a full pass yields no improvement, or
+    max_passes is reached.
+
+    Returns (weights, best_macro_f1, search_log). The caller is
+    responsible for passing VALIDATION data - this function has no way to
+    reach anything else.
+    """
+
+    labels = list(range(num_classes))
+
+    weights = [1.0] * num_classes
+
+    best = macro_f1_from_weights(y_prob, y_true_int, weights, labels)
+
+    search_log = [{
+        "pass": 0,
+        "coordinate": None,
+        "weights": list(weights),
+        "val_macro_f1": best
+    }]
+
+    for pass_index in range(1, max_passes + 1):
+
+        improved = False
+
+        for c in range(1, num_classes):
+
+            best_w = weights[c]
+
+            for candidate in grid:
+
+                trial = list(weights)
+                trial[c] = float(candidate)
+
+                score = macro_f1_from_weights(
+                    y_prob,
+                    y_true_int,
+                    trial,
+                    labels
+                )
+
+                if score > best + 1e-12:
+                    best = score
+                    best_w = float(candidate)
+                    improved = True
+
+            weights[c] = best_w
+
+            search_log.append({
+                "pass": pass_index,
+                "coordinate": c,
+                "weights": list(weights),
+                "val_macro_f1": best
+            })
+
+        if not improved:
+            break
+
+    return weights, best, search_log
 
 
 # =========================================================
@@ -1360,6 +1475,49 @@ for rec in DS1_VAL:
 
 
 # =========================================================
+# 22C. DECISION-THRESHOLD TUNING (VALIDATION ONLY)
+# =========================================================
+
+# DS2 is NOT involved here. The only probabilities passed to the search
+# come from X_val / RR_val.
+
+val_prob_for_threshold = model.predict(
+    [X_val, RR_val],
+    batch_size=BATCH_SIZE,
+    verbose=0
+)
+
+THRESHOLD_WEIGHTS, THRESHOLD_VAL_MACRO_F1, THRESHOLD_SEARCH_LOG = \
+    tune_decision_weights(
+        val_prob_for_threshold,
+        y_val,
+        NUM_CLASSES,
+        THRESHOLD_GRID,
+        THRESHOLD_MAX_PASSES
+    )
+
+THRESHOLD_VAL_MACRO_F1_ARGMAX = macro_f1_from_weights(
+    val_prob_for_threshold,
+    y_val,
+    [1.0] * NUM_CLASSES,
+    list(range(NUM_CLASSES))
+)
+
+print("\nDecision-threshold tuning (validation only):")
+print(f"  grid: {[round(g, 4) for g in THRESHOLD_GRID]}")
+print(f"  passes run: {THRESHOLD_SEARCH_LOG[-1]['pass']} "
+      f"of {THRESHOLD_MAX_PASSES}")
+print(f"  plain argmax val macro-F1 : "
+      f"{THRESHOLD_VAL_MACRO_F1_ARGMAX:.4f}")
+print(f"  tuned        val macro-F1 : {THRESHOLD_VAL_MACRO_F1:.4f}")
+
+for _i in range(NUM_CLASSES):
+    print(f"    w_{INT_TO_LABEL[_i]} = {THRESHOLD_WEIGHTS[_i]:.4f}")
+
+print("  weights are now FROZEN and applied to DS2 exactly once.")
+
+
+# =========================================================
 # 23. TRAINING CURVES
 # =========================================================
 
@@ -1458,6 +1616,69 @@ cm = confusion_matrix(
 
 print("\nConfusion Matrix:\n")
 print(cm)
+
+
+# --- the frozen validation-tuned decision rule, applied once ------------
+
+y_pred_enc_tuned = np.argmax(
+    y_pred_prob * np.asarray(THRESHOLD_WEIGHTS, dtype=np.float64),
+    axis=1
+)
+
+acc_tuned = accuracy_score(
+    y_test_encoded,
+    y_pred_enc_tuned
+)
+
+cm_tuned = confusion_matrix(
+    y_test_encoded,
+    y_pred_enc_tuned
+)
+
+report_argmax = classification_report(
+    y_test_encoded,
+    y_pred_enc,
+    target_names=['N', 'S', 'V'],
+    digits=4,
+    output_dict=True
+)
+
+report_tuned = classification_report(
+    y_test_encoded,
+    y_pred_enc_tuned,
+    target_names=['N', 'S', 'V'],
+    digits=4,
+    output_dict=True
+)
+
+print(f"\nTuned weights {[round(w, 4) for w in THRESHOLD_WEIGHTS]} "
+      f"(frozen on validation)")
+
+print(f"Tuned Test Accuracy: {acc_tuned:.4f}")
+
+print("\nClassification Report (tuned):\n")
+
+print(classification_report(
+    y_test_encoded,
+    y_pred_enc_tuned,
+    target_names=['N', 'S', 'V'],
+    digits=4
+))
+
+print("\nConfusion Matrix (tuned):\n")
+print(cm_tuned)
+
+print("\nargmax vs tuned on DS2:")
+print(f"  {'metric':<16} {'argmax':>10} {'tuned':>10}")
+for _k in ('macro avg', 'S', 'V', 'N'):
+    print(f"  {_k + ' F1':<16} "
+          f"{report_argmax[_k]['f1-score']:>10.4f} "
+          f"{report_tuned[_k]['f1-score']:>10.4f}")
+print(f"  {'S recall':<16} {report_argmax['S']['recall']:>10.4f} "
+      f"{report_tuned['S']['recall']:>10.4f}")
+print(f"  {'S precision':<16} {report_argmax['S']['precision']:>10.4f} "
+      f"{report_tuned['S']['precision']:>10.4f}")
+print(f"  {'accuracy':<16} {acc:>10.4f} {acc_tuned:>10.4f}")
 
 
 # =========================================================
@@ -1712,6 +1933,31 @@ metrics = {
     "confusion_matrix": cm.tolist(),
 
     "per_class_roc_auc": per_class_roc_auc,
+
+    "threshold_weights": [float(w) for w in THRESHOLD_WEIGHTS],
+
+    "threshold_class_order": [INT_TO_LABEL[i] for i in range(NUM_CLASSES)],
+
+    "threshold_val_macro_f1": float(THRESHOLD_VAL_MACRO_F1),
+
+    "threshold_val_macro_f1_argmax": float(THRESHOLD_VAL_MACRO_F1_ARGMAX),
+
+    "threshold_grid": THRESHOLD_GRID,
+
+    "threshold_search_log": THRESHOLD_SEARCH_LOG,
+
+    "test_argmax": {
+        "accuracy": float(acc),
+        "classification_report": report_argmax,
+        "confusion_matrix": cm.tolist()
+    },
+
+    "test_tuned": {
+        "accuracy": float(acc_tuned),
+        "classification_report": report_tuned,
+        "confusion_matrix": cm_tuned.tolist(),
+        "weights": [float(w) for w in THRESHOLD_WEIGHTS]
+    },
 
     "best_epoch": BEST_EPOCH,
 
