@@ -1,72 +1,51 @@
 # Last report
 
-**Task:** step 6 - sweep the focal-loss BETA and select on validation. Also:
-move the ablation generator into `tools/`.
+**Task:** E0 re-anchor - restore the step 3 training configuration, keep the
+step 5 validation set.
 
 **Date:** 2026-08-23
 
 ---
 
-## Step 5 predictions - scorecard
-
-All four passed.
-
-| # | prediction | outcome |
-|---|---|---|
-| 1 | 311 steps/epoch; `train_distribution` N=36631 / S=574 / V=2569 | **PASS** - exact (39,774 samples at batch 128 = 311) |
-| 2 | alpha approximately `[0.2350, 1.8775, 0.8875]`, counts `[36631, 574, 2569]` | **PASS** - exact |
-| 3 | largest single-epoch val macro-F1 swing under 0.10 (step 4: 0.1497) | **PASS** - **0.0724** |
-| 4 | four of five validation records carry V beats | **PASS** - 4 of 5 |
-
-**Step 5 did what it was for.** Selection variance halved and the
-test-minus-validation gap narrowed from -0.1689 to **-0.0617**. But test
-macro-F1 fell again to 0.5408, and the enlarged validation set made the
-actual problem legible: **6273 V predictions against 3220 true V beats
-(+95%)**. The model floods V. That is exactly what step 6 targets.
-
----
-
 ## What changed
 
-**`BETA_GRID = [0.0, 0.25, 0.41, 0.50]`** added in section 3.
+Reverted from HEAD (step 6), with the prior code **spliced verbatim out of
+commit `1a2509c`** rather than retyped. The patch script asserts each source
+region is unique before substituting, so the reverted blocks are byte-exact
+step 3 code.
 
-**The alpha derivation became a function.** `compute_focal_alpha(class_counts,
-beta)` replaces the inline module-level block, so the sweep can call it per
-BETA. Section 12 now prints the alpha vector for every BETA in the grid before
-training starts.
+**1. Augmentation re-enabled.** Section 18 is step 3's block again:
 
-**`reset_seeds(seed=SEED)`** added in section 1. Called at the top of each
-sweep iteration so every BETA trains from an identical initialisation -
-without it, a difference in val macro-F1 could be weight init rather than
-BETA.
+```python
+X_tr_aug, RR_tr_aug, y_tr_aug = augment_training_data(
+    X_tr,
+    RR_tr,
+    y_tr
+)
+```
 
-**`make_callbacks()`** added in section 21, returning fresh
-`(callbacks, val_metrics_cb, early_stopping)`. EarlyStopping and
-ReduceLROnPlateau carry mutable state (`wait`, `best`, `stopped_epoch`,
-`best_weights`) and `ValidationMetrics` accumulates a records list, so they
-cannot be reused across runs.
+**2. Scalar alpha, no sweep.** `FOCAL_ALPHA = 0.50` in section 3. Removed
+`BETA_GRID`, `FOCAL_BETA`, `compute_focal_alpha`, `make_callbacks`,
+`reset_seeds`, and the whole sweep loop - sections 20/21/22 are step 3's
+single build / single callback set / single `model.fit`. `FOCAL_GAMMA = 2.0`
+and `ADAM_LEARNING_RATE = 1e-4` are kept as named constants.
 
-**Section 20 no longer builds a model.** It just captures `ECG_INPUT_SHAPE`
-and `RR_INPUT_SHAPE`. Section 22 is now the sweep: for each BETA it resets
-seeds, computes alpha, assigns the module-level `FOCAL_ALPHA` (which
-`build_model` reads when it compiles), builds, trains, and records the result.
-The winning run's `model`, `history`, `val_metrics_cb` and `early_stopping`
-are kept under those exact names, so **sections 22B through 30 required no
-changes at all**.
+**3. Everything else stays at HEAD:** the 5 RR ratio features,
+`DS1_VAL = ['106','118','207','220','223']`, macro-F1 model selection, the
+`ValidationMetrics` callback, the per-record breakdown, train-only RR
+normalization.
 
-**metrics.json** gains `beta_grid`, `beta_sweep` (per BETA: alpha, best val
-macro-F1, best epoch, epochs run, early-stopping flag, full val macro-F1
-curve), `selected_beta`, and `selection_criterion`. `focal_loss_beta` now
-reports the *selected* beta; `focal_loss_beta_default` keeps the 0.5 constant.
+**Section headers 9 and 10** no longer say `[DEPRECATED]`. They now say the
+functions are live again, and record the two known defects that come back with
+them: the RR feature vector is copied unchanged across every duplicate, and
+the `np.roll` shift moves the R-peak off its aligned position.
 
-**`tools/make_ablation.py`** - the generator now lives in the repo with its
-gate assertions, so `docs/ablation.md` is reproducible without me. It supports
-`--check` (verify current, write nothing) for CI. The gate refuses to emit a
-row unless the metrics file identifies itself as the run the table claims, and
-it hashes every file to catch the duplicate-copy failure mode directly.
-
-Nothing else changed: no architecture, RR feature, learning-rate, split, or
-augmentation change. `DS1_VAL` is still `['106','118','207','220','223']`.
+**metrics.json config** reverts to `focal_loss_alpha: 0.50` and drops
+`beta_grid` / `focal_loss_beta` / `focal_alpha_class_counts` / `beta_sweep` /
+`selected_beta` / `selection_criterion`. `oversampling` is now `true`, and I
+added `oversampling_multipliers: {"N": 1, "S": 7, "V": 3}` so the expansion
+factors are recoverable from the run's own metrics rather than only from the
+code - flagged below as an addition beyond a pure revert.
 
 ---
 
@@ -74,112 +53,116 @@ augmentation change. `DS1_VAL` is still `['106','118','207','220','223']`.
 
 **py_compile** - passed, exit code 0.
 
-**`ast.dump` comparison:**
+**`ast.dump` against step 6 HEAD:**
 
 ```
-changed  : NONE
-added    : ['compute_focal_alpha', 'make_callbacks', 'reset_seeds']
-removed  : NONE
-unchanged: 12 of 12
-classes changed: NONE
+changed  : ['categorical_focal_loss']
+added    : NONE
+removed  : ['compute_focal_alpha', 'make_callbacks', 'reset_seeds']
 ```
 
-**Zero existing functions changed.** `build_model` and
-`categorical_focal_loss` are untouched - the sweep drives them through the
-module-level `FOCAL_ALPHA` global rather than by editing either one.
-
-**The test set is not evaluated inside the sweep.** There are two loops over
-`BETA_GRID`; the sweep is the one with target `sweep_beta`:
+**`ast.dump` against step 3 (`1a2509c`) - the revert target:**
 
 ```
-`for _beta in BETA_GRID:`      lines  839-842   <- printing alphas only
-`for sweep_beta in BETA_GRID:` lines 1331-1412  <- the sweep
+differ from step 3: ['build_model', 'categorical_focal_loss']
+only in HEAD      : NONE
+only in step 3    : NONE
 ```
 
-Walking every AST node inside lines 1331-1412 for the names `X_test`,
-`RR_test`, `y_test`, `y_test_encoded`, `y_test_cat`, `DS2`, `y_pred_prob`,
-`y_pred_enc`, `acc`, `cm`:
+Two functions differ from step 3, and **both differences are the step 4
+constant-hoisting you told me to keep, not behaviour**:
 
-```
-found: NONE          RESULT: CLEAN
-```
+```diff
+build_model (6 diff lines, all in model.compile):
+-            learning_rate=1e-4          +            learning_rate=ADAM_LEARNING_RATE
+-            alpha=0.50,                 +            alpha=FOCAL_ALPHA,
+-            gamma=2.0                   +            gamma=FOCAL_GAMMA
 
-Every `predict`/`evaluate` call in the file, with its position relative to the
-sweep:
-
-```
-line 1606  outside sweep  args: ['model', 'X_test', 'RR_test', 'BATCH_SIZE']
-line 1484  outside sweep  args: ['model', 'X_val', 'RR_val']
-line 1216  outside sweep  args: ['self', 'self']   <- inside ValidationMetrics, val only
+categorical_focal_loss:
+-    alpha=0.50,                         +    alpha,          (required, no default)
+                                         +    alpha = tf.constant(alpha, dtype=tf.float32)
+                                         +    (docstring rewritten)
 ```
 
-The code path in order:
+`ADAM_LEARNING_RATE` is 1e-4, `FOCAL_ALPHA` is 0.50, `FOCAL_GAMMA` is 2.0 -
+the exact values step 3 had inline. `tf.constant(0.50)` broadcasts identically
+to step 3's bare Python float. **The training configuration is numerically
+identical to step 3.** I kept `alpha` required rather than restoring the
+`alpha=0.50` default, so a scalar can never be reached by accident again; the
+call site now states it explicitly.
+
+**`augment_training_data` IS called** - AST call-graph, not grep:
 
 ```
-1. sweep trains 4 models, validation only   lines 1331-1412
-2. selection keeps the winning model        line 1409  (model = sweep_model)
-3. FOCAL_ALPHA reset to the selected beta   line 1417
-4. DS2 scored ONCE on that model            line 1607  ([X_test, RR_test],)
+augment_training_data    called from: ['<module>']
+augment_segment          called from: ['augment_training_data']
+build_model              called from: ['<module>']
 ```
+
+**Scalar alpha, no BETA:**
+
+```
+FOCAL_ALPHA = 0.50                      <- scalar
+BETA_GRID           occurrences: 0
+FOCAL_BETA          occurrences: 0
+compute_focal_alpha occurrences: 0
+sweep_beta          occurrences: 0
+BETA_SWEEP          occurrences: 0
+SELECTED_BETA       occurrences: 0
+make_callbacks      occurrences: 0
+reset_seeds         occurrences: 0
+```
+
+**One model, one fit:** `build_model` called once (line 1105), `model.fit`
+called once (line 1240). No module-level loop over any BETA grid remains.
 
 **Constants unchanged** (one occurrence each, before and after):
 `PRE_SAMPLES = 90`, `POST_SAMPLES = 144`, `ADAM_LEARNING_RATE = 1e-4`,
-`FOCAL_GAMMA = 2.0`, `FOCAL_BETA = 0.5`, `RR_LOCAL_WINDOW = 10`,
-`RR_CLIP_MIN = 0.2`, `RR_CLIP_MAX = 3.0`. The `rr = [...]` source block and
-`RR_FEATURE_NAMES` are byte-identical. `DS1` `9f20e3ac1758a312...`, `DS2`
-`b8a3e6bbdeeec72a...`, `DS1_VAL` `f6759845186d6324...` - all unchanged.
+`FOCAL_GAMMA = 2.0`, `RR_LOCAL_WINDOW = 10`, `RR_CLIP_MIN = 0.2`,
+`RR_CLIP_MAX = 3.0`, `multiplier = 6`.
 
-**Alpha verified numerically** for every BETA against DS1_TRAIN counts
-`[36631, 574, 2569]`, each checked against an independent recomputation of
-`(1/count)**beta` rescaled to sum 3:
+**The 5 RR features** - the `rr = [...]` source block is byte-identical to
+both HEAD and step 3; `RR_FEATURE_NAMES` unchanged.
 
-| beta | alpha | sum | S:N | V:N |
-|---|---|---|---|---|
-| 0.00 | `[1.0000, 1.0000, 1.0000]` | 3.0000 | 1.000 | 1.000 |
-| 0.25 | `[0.5200, 1.4696, 1.0104]` | 3.0000 | 2.826 | 1.943 |
-| 0.41 | `[0.3168, 1.7412, 0.9419]` | 3.0000 | 5.496 | **2.973** |
-| 0.50 | `[0.2350, 1.8775, 0.8875]` | 3.0000 | 7.989 | 3.776 |
-
-All four sum to exactly 3.0, all match the independent recomputation to 1e-6,
-and `beta=0.0` gives exactly `[1, 1, 1]`.
-
-**`BETA=0.41` reproduces V:N = 2.973**, essentially the 3.000 the old
-oversampling produced - so the grid contains a point that undoes precisely the
-over-weighting identified in the problem statement.
-
-**`tools/make_ablation.py`** regenerates `docs/ablation.md` and then reports
-`up to date (7 runs)` on a second invocation with `--check`, so it is
-idempotent. The gate immediately earned its place: it rejected my own first
-draft, where I had asserted step 1b's `rr_norm_mean` was a 3-vector when that
-run predates the 5 ratio features and has 2. That is the failure the tool
-exists to prevent, caught on the tool's first run.
+**Record literals:** `DS1` `9f20e3ac1758a312...`, `DS2` `b8a3e6bbdeeec72a...`,
+`DS1_VAL` `f6759845186d6324...` - all unchanged, and `DS1_VAL` is still
+`['106', '118', '207', '220', '223']`.
 
 ---
 
-## Falsifiable predictions for the next Kaggle run
+## Falsifiable prediction: steps/epoch
 
-1. **`beta_sweep` will have 4 entries** with alphas exactly as tabulated
-   above, and `selected_beta` will be whichever has the highest
-   `best_val_macro_f1`. `config.focal_loss_beta` will equal `selected_beta`,
-   while `focal_loss_beta_default` stays 0.50.
-2. **`BETA=0.50` will not win.** It is the current setting and it produces the
-   V flooding this step exists to fix. I expect **0.25 or 0.41** to be
-   selected.
-3. **V predictions will fall well below step 5's 6273** for the selected
-   model - I expect under 4,500 against 3,220 true V beats. This is the
-   mechanistic test.
-4. **Runtime roughly 4x step 5's**, since four models train instead of one.
+E0 is the first run to combine augmentation with the 17-record training pool,
+so it should produce a step count no previous run has had:
 
-I am **not** predicting macro-F1 clears 0.6800. If `BETA=0.0` wins, that is
-the informative outcome: it would mean class reweighting was never helping and
-the S problem is not a weighting problem at all.
+```
+DS1_TRAIN (17 records): N=36631, S=574, V=2569   raw total 39,774
+post-augmentation: 36631*1 + 574*7 + 2569*3 = 48,356
+steps/epoch @ batch 128 = 378
+```
+
+| run | training pool | augmentation | samples | steps/epoch |
+|---|---|---|---|---|
+| step 3 | 19 records | on | 54,306 | 425 |
+| step 5 | 17 records | off | 39,774 | 311 |
+| **E0** | **17 records** | **on** | **48,356** | **378** |
+
+**Prediction: 378 steps/epoch.** `config.oversampling` will be `true`,
+`config.focal_loss_alpha` will be the scalar `0.5`, and there will be no
+`beta_sweep` key. `train_distribution` will still read N=36631 / S=574 /
+V=2569 - that field is computed before augmentation, so it does not change.
+
+**If steps/epoch is not 378, the revert did not do what I think it did.**
+
+I am deliberately **not** predicting a macro-F1 value. E0 exists to establish
+a baseline for a configuration that has never been run, not to beat one.
 
 ---
 
 ## Commit
 
 ```
-25229d9  step 6: validation-selected focal BETA sweep
+042597b  E0: re-anchor - step 3 training config with 5-record validation
 ```
 
 Pushed to `origin/main`. This report lands in a small follow-up commit.
@@ -188,29 +171,35 @@ Pushed to `origin/main`. This report lands in a small follow-up commit.
 
 ## Problems
 
-1. **Four trainings per run, one selection - the sweep multiplies runtime by
-   4** and, with `EPOCHS=40`, could reach 160 epochs. If Kaggle times out, the
-   grid is the thing to trim, not the epoch budget.
+1. **Hard constraint 2 is violated again, deliberately.** Augmentation is back
+   on: S x7, V x3, with the RR feature vector copied unchanged across every
+   duplicate. That last part is worse now than it was at step 3, because the
+   RR vector is no longer two raw intervals but five patient-relative ratios -
+   the features this project spent step 3 making meaningful are the ones being
+   duplicated verbatim. CLAUDE.md's "Known facts" entry currently says
+   augmentation was removed at step 4 and is dead code; **that is now stale
+   again**. I have not edited it, because you did not ask and E0's scope was
+   the revert - but it should be corrected before the next task or the next
+   reader will act on a wrong fact. Say the word.
 
-2. **Selecting BETA on DS1_VAL adds a selection degree of freedom.** We now
-   choose both a checkpoint *and* a hyperparameter against 10,796 validation
-   beats, 369 of them S. That is legitimate - DS2 is untouched - but the
-   validation estimate is optimistically biased for the winner, and the
-   test-minus-validation gap should be read with that in mind. Worth one
-   sentence in the methods section.
+2. **`docs/ablation.md` has no E0 row and cannot have one yet** - no
+   `results/E0.../metrics.json` exists. `tools/make_ablation.py` will need an
+   entry appended when the run comes back; its gate will reject a folder that
+   does not identify itself correctly.
 
-3. **Four models are held in memory at peak**, and discarded ones are left to
-   GC rather than freed explicitly. I deliberately did not call
-   `tf.keras.backend.clear_session()`, which would destroy the retained winner
-   too. If memory becomes a problem on the P100, saving each model to disk and
-   reloading the winner is the fix.
+3. **One addition beyond a pure revert:** `oversampling_multipliers` in the
+   config block. Step 3 recorded nothing about augmentation at all, which is
+   precisely why detecting it later required counting steps/epoch. Recording
+   the multipliers costs nothing and makes the run self-describing. Flagging
+   it as a deviation from the letter of "revert".
 
-4. **The step 3 condition remains unresolved for a third step.** Step 4's
-   selection was confounded, step 5's was clean but V flooding dominates. If
-   step 6 does not clear 0.6800 either, the honest reading is that the ratio
-   features need reconsidering on their own terms rather than waiting for
-   another confounder to clear.
+4. **This is a two-variable change relative to both neighbours.** Against step
+   3 it changes the validation set; against step 5 it changes the training
+   configuration. That is the intent - the combination has never been run -
+   but E0's number is a new anchor, not a delta against anything in the
+   existing table.
 
-5. Carried over: record 114 lead swap still unfixed; `tools/inspect_ds1.py`
-   still writes its JSON into `tools/` and that JSON is now stale relative to
-   the current DS1_VAL; stale root `__pycache__/` still present.
+5. Carried over: record 114 lead swap still unfixed; record 207 still a
+   validation outlier; `tools/inspect_ds1.py` still writes its JSON into
+   `tools/` and that JSON is stale relative to the current `DS1_VAL`; stale
+   root `__pycache__/` still present.
