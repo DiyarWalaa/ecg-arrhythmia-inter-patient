@@ -1,51 +1,106 @@
 # Last report
 
-**Task:** E0 re-anchor - restore the step 3 training configuration, keep the
-step 5 validation set.
+**Task:** E1 - revert `DS1_VAL` to 3 records, add validation-tuned decision
+thresholds. Also: correct the stale CLAUDE.md "Known facts".
 
 **Date:** 2026-08-23
 
 ---
 
-## What changed
+## E0 prediction - scorecard
 
-Reverted from HEAD (step 6), with the prior code **spliced verbatim out of
-commit `1a2509c`** rather than retyped. The patch script asserts each source
-region is unique before substituting, so the reverted blocks are byte-exact
-step 3 code.
+| # | prediction | outcome |
+|---|---|---|
+| 1 | 378 steps/epoch; `train_distribution` N=36631 / S=574 / V=2569; `oversampling: true`; scalar alpha `0.5`; no `beta_sweep` key | **PASS** - distribution exact, `oversampling: true`, `alpha 0.5`, `oversampling_multipliers {N:1, S:7, V:3}` |
 
-**1. Augmentation re-enabled.** Section 18 is step 3's block again:
+E0's diagnosis is confirmed directly by its own history. The per-class
+validation curves show exactly the mechanism you described:
 
-```python
-X_tr_aug, RR_tr_aug, y_tr_aug = augment_training_data(
-    X_tr,
-    RR_tr,
-    y_tr
-)
+```
+val_f1_V : 0.3114  0.6617  0.5867  0.5663  0.4157  0.3944 ...   peaks epoch 2
+val_f1_S : 0.2629  0.1852  0.2466  0.2658  0.2661  0.2869 ...   still rising at 6
+val_macro: 0.5112  0.5911  0.5774  0.5768  0.4958  0.4872 ...   follows V
 ```
 
-**2. Scalar alpha, no sweep.** `FOCAL_ALPHA = 0.50` in section 3. Removed
-`BETA_GRID`, `FOCAL_BETA`, `compute_focal_alpha`, `make_callbacks`,
-`reset_seeds`, and the whole sweep loop - sections 20/21/22 are step 3's
-single build / single callback set / single `model.fit`. `FOCAL_GAMMA = 2.0`
-and `ADAM_LEARNING_RATE = 1e-4` are kept as named constants.
+macro-F1 peaks at epoch 2 because V peaks at epoch 2. S never gets the
+chance to mature.
 
-**3. Everything else stays at HEAD:** the 5 RR ratio features,
-`DS1_VAL = ['106','118','207','220','223']`, macro-F1 model selection, the
-`ValidationMetrics` callback, the per-record breakdown, train-only RR
-normalization.
+---
 
-**Section headers 9 and 10** no longer say `[DEPRECATED]`. They now say the
-functions are live again, and record the two known defects that come back with
-them: the RR feature vector is copied unchanged across every duplicate, and
-the `np.roll` shift moves the R-peak off its aligned position.
+## Part 1 - revert
 
-**metrics.json config** reverts to `focal_loss_alpha: 0.50` and drops
-`beta_grid` / `focal_loss_beta` / `focal_alpha_class_counts` / `beta_sweep` /
-`selected_beta` / `selection_criterion`. `oversampling` is now `true`, and I
-added `oversampling_multipliers: {"N": 1, "S": 7, "V": 3}` so the expansion
-factors are recoverable from the run's own metrics rather than only from the
-code - flagged below as an addition beyond a pure revert.
+`DS1_VAL = ['207', '220', '223']`, byte-identical to step 3's literal.
+`DS1_TRAIN` is still computed and now resolves to 19 records, with **106 and
+118 back in training**.
+
+`VAL_SELECTION_RULE` in `metrics.json` is rewritten to record the revert
+rather than the step 5 rationale: the records, the history, `reverted_at:
+"E1"`, the full `revert_reason` (106 has 520 V / **zero** S, 118 has 16 V /
+96 S, validation became 85.3% N / 11.3% V / 3.4% S, V-F1 peaks epoch 2 while
+S-F1 rises to epoch 6, E0 selected epoch 2 and scored 0.5591 against a
+required 0.6400), the still-binding exclusions of 209 and 201, and the
+accepted limitation that 220 has zero V beats.
+
+---
+
+## Part 2 - decision-threshold tuning
+
+New section **11B** defines two functions; new section **22C** runs the
+search; section **24** reports both rules.
+
+`tune_decision_weights(y_prob, y_true_int, num_classes, grid, max_passes)`
+does coordinate ascent on `w`, with `w_N` pinned to 1.0 (scaling all three
+classes leaves the argmax unchanged, so one must be the reference). Each pass
+sweeps `w_S` then `w_V` over the whole grid keeping the best; passes repeat
+until one yields no improvement, or `max_passes` is reached. It returns
+`(weights, best_macro_f1, search_log)`.
+
+`THRESHOLD_GRID` is 15 log-spaced points from **0.25 to 32** (2^-2 .. 2^5,
+constant ratio sqrt(2)). `THRESHOLD_MAX_PASSES = 6`.
+
+`metrics.json` gains `threshold_weights`, `threshold_class_order`,
+`threshold_val_macro_f1`, `threshold_val_macro_f1_argmax`, `threshold_grid`,
+`threshold_search_log`, and two complete blocks **`test_argmax`** and
+**`test_tuned`**, each with accuracy, classification report and confusion
+matrix. The existing top-level `classification_report` / `confusion_matrix` /
+`test_accuracy` are left as the **argmax** values so `tools/make_ablation.py`
+and every prior row stay comparable.
+
+---
+
+## Proof that the search never touches DS2
+
+Same method as the BETA-sweep isolation, but stronger, because the search is
+a **pure function**. I computed each function's free variables - names
+referenced but neither an argument nor bound locally:
+
+```
+tune_decision_weights (lines 764-829)
+  args       : ['grid', 'max_passes', 'num_classes', 'y_prob', 'y_true_int']
+  free names : ['float', 'list', 'macro_f1_from_weights', 'range']
+  test names : NONE                                        -> CLEAN
+
+macro_f1_from_weights (lines 746-761)
+  args       : ['labels', 'weights', 'y_prob', 'y_true_int']
+  free names : ['float', 'np', 'precision_recall_fscore_support']
+  test names : NONE                                        -> CLEAN
+```
+
+Every name either arrives as an argument or is a builtin / module import.
+**Neither function can reach `X_test`, `RR_test` or `y_test_encoded` even in
+principle** - there is no path, not merely no current use.
+
+The call site passes validation probabilities only:
+
+```
+line 1491: tune_decision_weights(val_prob_for_threshold, y_val,
+                                 NUM_CLASSES, THRESHOLD_GRID,
+                                 THRESHOLD_MAX_PASSES)
+
+val_prob_for_threshold = model.predict([X_val, RR_val], ...)
+```
+
+Ordering: weights frozen at line 1491, first applied to DS2 at line 1623.
 
 ---
 
@@ -53,116 +108,118 @@ code - flagged below as an addition beyond a pure revert.
 
 **py_compile** - passed, exit code 0.
 
-**`ast.dump` against step 6 HEAD:**
+**`ast.dump` against E0 HEAD:**
 
 ```
-changed  : ['categorical_focal_loss']
-added    : NONE
-removed  : ['compute_focal_alpha', 'make_callbacks', 'reset_seeds']
+changed : NONE
+added   : ['macro_f1_from_weights', 'tune_decision_weights']
+removed : NONE
 ```
 
-**`ast.dump` against step 3 (`1a2509c`) - the revert target:**
+**Zero existing functions changed.** Against step 3 the only differences are
+`build_model` and `categorical_focal_loss`, and those are the hoisted
+constant names carried over from E0 - identical values.
+
+**Split membership** - all pass: `DS1_VAL == ['207','220','223']`, 106 and
+118 back in `DS1_TRAIN`, 209 and 201 in training, disjoint from DS2, and the
+two sets partition DS1.
 
 ```
-differ from step 3: ['build_model', 'categorical_focal_loss']
-only in HEAD      : NONE
-only in step 3    : NONE
+DS1_TRAIN (19): 101 106 108 109 112 114 115 116 118 119 122
+                124 201 203 205 208 209 215 230
+train {'N': 40301, 'S': 670, 'V': 3105}  raw 44076 -> aug 54306
+val   {'N': 5538,  'S': 273, 'V': 683}   total 6494
+val composition: 85.3% N / 4.2% S / 10.5% V
 ```
 
-Two functions differ from step 3, and **both differences are the step 4
-constant-hoisting you told me to keep, not behaviour**:
+Compare E0's validation: 85.3% N / **3.4% S / 11.3% V**. The revert roughly
+swaps the S and V shares, which is the whole point.
 
-```diff
-build_model (6 diff lines, all in model.compile):
--            learning_rate=1e-4          +            learning_rate=ADAM_LEARNING_RATE
--            alpha=0.50,                 +            alpha=FOCAL_ALPHA,
--            gamma=2.0                   +            gamma=FOCAL_GAMMA
+**Constants unchanged** (one occurrence each): `PRE_SAMPLES = 90`,
+`POST_SAMPLES = 144`, `FOCAL_ALPHA = 0.50`, `FOCAL_GAMMA = 2.0`,
+`ADAM_LEARNING_RATE = 1e-4`, `RR_LOCAL_WINDOW = 10`, `RR_CLIP_MIN = 0.2`,
+`RR_CLIP_MAX = 3.0`.
 
-categorical_focal_loss:
--    alpha=0.50,                         +    alpha,          (required, no default)
-                                         +    alpha = tf.constant(alpha, dtype=tf.float32)
-                                         +    (docstring rewritten)
-```
+**Augmentation multipliers** inside `augment_training_data` are
+`[0, 6, 2, 0]` - identical to step 3. `augment_training_data` is still called
+from `<module>` (AST call-graph).
 
-`ADAM_LEARNING_RATE` is 1e-4, `FOCAL_ALPHA` is 0.50, `FOCAL_GAMMA` is 2.0 -
-the exact values step 3 had inline. `tf.constant(0.50)` broadcasts identically
-to step 3's bare Python float. **The training configuration is numerically
-identical to step 3.** I kept `alpha` required rather than restoring the
-`alpha=0.50` default, so a scalar can never be reached by accident again; the
-call site now states it explicitly.
+**The 5 RR features**: `rr = [...]` block byte-identical to both HEAD and
+step 3; `RR_FEATURE_NAMES` unchanged. `DS1` `9f20e3ac1758a312...`, `DS2`
+`b8a3e6bbdeeec72a...` unchanged; `DS1_VAL` now matches step 3's literal
+exactly.
 
-**`augment_training_data` IS called** - AST call-graph, not grep:
+**Coordinate ascent, behavioural test** on synthetic data shaped like the
+real DS1_VAL (5538 N / 273 S / 683 V) with a deliberately under-calling S
+model, using the functions lifted from the edited source:
 
 ```
-augment_training_data    called from: ['<module>']
-augment_segment          called from: ['augment_training_data']
-build_model              called from: ['<module>']
+plain argmax macro-F1 : 0.6648
+tuned        macro-F1 : 0.6718   (weights [1.0, 1.0, 0.7071])
+passes run: 2 of 6
+S recall 0.3443 -> 0.3590   S predicted 397 -> 425 (true 273)
+
+[PASS] w_N pinned to exactly 1.0
+[PASS] tuned >= argmax
+[PASS] macro-F1 non-decreasing across the search log
+[PASS] terminated within max_passes
+[PASS] every returned weight came from the grid
+[PASS] reported best matches an independent recomputation
+[PASS] S recall improved
+[PASS] repeat run gives identical weights (deterministic)
+[PASS] perfect classifier -> macro-F1 1.0000, no weight change needed
 ```
 
-**Scalar alpha, no BETA:**
-
-```
-FOCAL_ALPHA = 0.50                      <- scalar
-BETA_GRID           occurrences: 0
-FOCAL_BETA          occurrences: 0
-compute_focal_alpha occurrences: 0
-sweep_beta          occurrences: 0
-BETA_SWEEP          occurrences: 0
-SELECTED_BETA       occurrences: 0
-make_callbacks      occurrences: 0
-reset_seeds         occurrences: 0
-```
-
-**One model, one fit:** `build_model` called once (line 1105), `model.fit`
-called once (line 1240). No module-level loop over any BETA grid remains.
-
-**Constants unchanged** (one occurrence each, before and after):
-`PRE_SAMPLES = 90`, `POST_SAMPLES = 144`, `ADAM_LEARNING_RATE = 1e-4`,
-`FOCAL_GAMMA = 2.0`, `RR_LOCAL_WINDOW = 10`, `RR_CLIP_MIN = 0.2`,
-`RR_CLIP_MAX = 3.0`, `multiplier = 6`.
-
-**The 5 RR features** - the `rr = [...]` source block is byte-identical to
-both HEAD and step 3; `RR_FEATURE_NAMES` unchanged.
-
-**Record literals:** `DS1` `9f20e3ac1758a312...`, `DS2` `b8a3e6bbdeeec72a...`,
-`DS1_VAL` `f6759845186d6324...` - all unchanged, and `DS1_VAL` is still
-`['106', '118', '207', '220', '223']`.
+The synthetic model under-calls S far less severely than ours does, so the
+gain there is small; the test validates the mechanics, not the magnitude.
 
 ---
 
-## Falsifiable prediction: steps/epoch
+## Falsifiable predictions
 
-E0 is the first run to combine augmentation with the 17-record training pool,
-so it should produce a step count no previous run has had:
+1. **425 steps/epoch** - 40301 + 670x7 + 3105x3 = 54,306 at batch 128.
+   That is exactly step 3's count, which is the point: E1 restores step 3's
+   training configuration.
+2. **The plain-argmax confusion matrix will reproduce step 3's**
+   `[[43233,479,521],[692,278,866],[138,8,3074]]`, and `best_epoch` will be
+   8. The pipeline is deterministic and nothing on the training path changed.
+   **Any mismatch is a bug, and I will report it as one rather than as a
+   result.**
+3. **`threshold_weights[1]` (w_S) will be greater than 1.0** - substantially
+   so, given the model under-calls S about 6x. `w_N` will be exactly 1.0.
+4. **Tuned S recall will exceed argmax S recall by a wide margin**, with S
+   precision falling. Whether tuned *macro-F1* beats argmax is genuinely
+   open: the search maximises validation macro-F1, but 273 validation S beats
+   is a thin basis and the weights may not transfer to DS2's 1836.
 
-```
-DS1_TRAIN (17 records): N=36631, S=574, V=2569   raw total 39,774
-post-augmentation: 36631*1 + 574*7 + 2569*3 = 48,356
-steps/epoch @ batch 128 = 378
-```
+Prediction 2 is the integrity check on the revert. Prediction 4 is the
+experiment.
 
-| run | training pool | augmentation | samples | steps/epoch |
-|---|---|---|---|---|
-| step 3 | 19 records | on | 54,306 | 425 |
-| step 5 | 17 records | off | 39,774 | 311 |
-| **E0** | **17 records** | **on** | **48,356** | **378** |
+---
 
-**Prediction: 378 steps/epoch.** `config.oversampling` will be `true`,
-`config.focal_loss_alpha` will be the scalar `0.5`, and there will be no
-`beta_sweep` key. `train_distribution` will still read N=36631 / S=574 /
-V=2569 - that field is computed before augmentation, so it does not change.
+## CLAUDE.md corrections
 
-**If steps/epoch is not 378, the revert did not do what I think it did.**
-
-I am deliberately **not** predicting a macro-F1 value. E0 exists to establish
-a baseline for a configuration that has never been run, not to beat one.
+- The augmentation entry said it was removed at step 4 and is dead code.
+  Corrected: **active again since E0** (S x7, V x3, called from section 18),
+  violating hard constraint 2 deliberately, with the RR-duplication defect
+  now worse than at step 3 because the duplicated vector is the five
+  patient-relative ratios. Also records that `FOCAL_ALPHA` is back to the
+  scalar 0.50 and that balancing lives in the data, not the loss.
+- The DS1_VAL entry now records the E1 revert with the V-heavy-validation
+  reason, the accepted zero-V limitation of record 220, and that steps 5, 6
+  and E0 are not comparable to the rest.
+- Current state gains the E0 row and the statement that E1's argmax result
+  must reproduce step 3's confusion matrix.
+- Blocking problem rewritten around the real finding: our S precision matches
+  the literature while S recall is 6x worse, which points at the decision
+  rule rather than the features.
 
 ---
 
 ## Commit
 
 ```
-042597b  E0: re-anchor - step 3 training config with 5-record validation
+3d3494b  E1: revert DS1_VAL to 3 records, add validation-tuned decision thresholds
 ```
 
 Pushed to `origin/main`. This report lands in a small follow-up commit.
@@ -171,35 +228,33 @@ Pushed to `origin/main`. This report lands in a small follow-up commit.
 
 ## Problems
 
-1. **Hard constraint 2 is violated again, deliberately.** Augmentation is back
-   on: S x7, V x3, with the RR feature vector copied unchanged across every
-   duplicate. That last part is worse now than it was at step 3, because the
-   RR vector is no longer two raw intervals but five patient-relative ratios -
-   the features this project spent step 3 making meaningful are the ones being
-   duplicated verbatim. CLAUDE.md's "Known facts" entry currently says
-   augmentation was removed at step 4 and is dead code; **that is now stale
-   again**. I have not edited it, because you did not ask and E0's scope was
-   the revert - but it should be corrected before the next task or the next
-   reader will act on a wrong fact. Say the word.
+1. **Tuning thresholds on 273 validation S beats is a thin basis.** The
+   weights are selected to maximise macro-F1 over a validation set whose S
+   class is 4.2% of 6,494 beats. That is a real overfitting risk, and it is
+   why both results are reported rather than only the tuned one. If tuned
+   macro-F1 beats argmax on validation but not on DS2, that gap is the
+   finding, not a failure.
 
-2. **`docs/ablation.md` has no E0 row and cannot have one yet** - no
-   `results/E0.../metrics.json` exists. `tools/make_ablation.py` will need an
-   entry appended when the run comes back; its gate will reject a folder that
-   does not identify itself correctly.
+2. **The threshold search adds a second selection layer on the same
+   validation set** that already picks the epoch. Validation macro-F1 is now
+   doubly optimistic. DS2 is untouched so the test number stays honest, but
+   the validation figure should not be quoted as an estimate of test
+   performance.
 
-3. **One addition beyond a pure revert:** `oversampling_multipliers` in the
-   config block. Step 3 recorded nothing about augmentation at all, which is
-   precisely why detecting it later required counting steps/epoch. Recording
-   the multipliers costs nothing and makes the run self-describing. Flagging
-   it as a deviation from the letter of "revert".
+3. **Plots in sections 25-28 still use the argmax predictions.** I left them
+   comparable to previous runs rather than silently switching them to the
+   tuned rule. The tuned confusion matrix is in `metrics.json` under
+   `test_tuned` but is not plotted.
 
-4. **This is a two-variable change relative to both neighbours.** Against step
-   3 it changes the validation set; against step 5 it changes the training
-   configuration. That is the intent - the combination has never been run -
-   but E0's number is a new anchor, not a delta against anything in the
-   existing table.
+4. **Hard constraint 2 is still violated** - augmentation remains on, and the
+   RR duplication defect is live. E1 does not address it; that is a later
+   step and it needs a replacement balancing mechanism.
 
-5. Carried over: record 114 lead swap still unfixed; record 207 still a
-   validation outlier; `tools/inspect_ds1.py` still writes its JSON into
-   `tools/` and that JSON is stale relative to the current `DS1_VAL`; stale
-   root `__pycache__/` still present.
+5. **`docs/ablation.md` has no E0 or E1 rows yet.** E0's results are now
+   committed, so its row can be added; I did not add one because
+   `tools/make_ablation.py` needs a `RUNS` entry and E0's headline number
+   only makes sense alongside E1's. Worth doing in one pass once E1 returns.
+
+6. Carried over: record 114 lead swap still unfixed; record 207 still a
+   validation outlier; `tools/inspect_ds1.py` writes its JSON into `tools/`
+   and that JSON is stale; stale root `__pycache__/` present.
