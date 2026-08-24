@@ -1,140 +1,63 @@
 # Last report
 
-**Task:** E2 fix - one normalization path for all beats.
+**Task:** E3 - log-space the wavelet scales down to 3 Hz to capture P-wave
+frequencies.
 
 **Date:** 2026-08-25
 
 ---
 
-## What changed
+## E2 predictions - scorecard
 
-Augmentation now perturbs the **raw waveform** and re-enters the same tail the
-originals use. Both routes are now:
+E2's results arrived and are now committed with an ablation row.
 
-```
-raw 234-sample window -> normalize_segment -> cwt_ricker -> (234, 9)
-```
+| # | prediction | outcome |
+|---|---|---|
+| 1 | 425 steps/epoch, `train_distribution` N=40301 / S=670 / V=3105 | **PASS** |
+| 2 | first Conv1D 1,472 params, total 239,171 | **PASS** (9 channels as designed) |
+| 3 | `wavelet_centre_frequencies` = `[10, 20, ..., 90]` | **PASS** - exact |
+| 4 | E2 is now a valid one-variable ablation against E1 | **PASS** - see below |
 
-- `extract_beats_from_record` keeps the z-scored raw waveform alongside the
-  scalogram and returns it as a fourth value; `load_dataset` passes it
-  through as `X_raw`.
-- `augment_training_data(X, X_raw, RR, y)` now iterates `X_raw`, perturbs the
-  waveform via `augment_segment`, and then applies `cwt_ricker` itself. The
-  originals in `X_list[0]` are the scalograms section 7 already produced.
-- The post-CWT global z-score is **gone**. `augment_segment` is back to
-  operating on a 1-D waveform, so its `normalize_segment` call is the same
-  per-beat z-score the originals get - not a z-score over 234x9 values.
-- The three `load_dataset` call sites take the extra return value;
-  validation and test discard it with `_` since only training augments.
+**Prediction 4 needed checking, not assuming.** The E2 run is stamped
+`2026-08-24T21:43:12`; the normalization fix was committed at 00:31:22 +0300
+= **21:31:22 UTC**. Kaggle stamps UTC, so the run started **12 minutes after
+the fix landed** and therefore includes it. E2's 0.7178 is the clean number,
+not the mis-scaled one. That reasoning is recorded in the ablation note rather
+than left implicit.
 
-Amplitude scaling, time shift and Gaussian noise are unchanged and still
-applied before normalization, exactly as before E2.
-
----
-
-## The two code paths, from the AST
-
-```
-ORIGINAL beat  (extract_beats_from_record):
-   line 603   normalize_segment
-   line 608   cwt_ricker
-
-AUGMENTED beat (augment_training_data -> augment_segment):
-   line 730   normalize_segment   (inside augment_segment)
-   line 790   augment_segment
-   line 792   cwt_ricker
-```
-
-Both end `normalize_segment -> cwt_ricker -> (234, 9)`. Verified by counting
-real `ast.Call` nodes rather than substrings:
-
-- `augment_training_data` makes **no** `normalize_segment` call of its own
-- `augment_segment` makes **exactly one**
-- `extract_beats_from_record` calls them in the order
-  `[normalize_segment, cwt_ricker]`, once each
-- `cwt_ricker` does not appear inside `augment_segment` at all
-
-*(My first version of this check tested `"normalize_segment" not in
-source`, which failed on the explanatory comment that names the function.
-The substring test was wrong, not the code; it now counts call nodes.)*
+**E2 is the best run so far: macro-F1 0.7178** against E1's 0.6645, and the
+gain is almost entirely V - V-F1 0.8004 -> 0.9111, V precision 0.6891 ->
+0.9495, N-called-V 521 -> 95, S-called-V 866 -> 55. S moved very little,
+0.2138 -> 0.2686. Two caveats now in the table: `best_epoch` was **1**, and
+threshold tuning failed to transfer for the second run running (validation
+0.5557 -> 0.5822, test 0.7178 -> 0.6332).
 
 ---
 
-## Per-channel statistics: original vs augmented
+## What changed in E3
 
-Record 209, 3,004 originals plus 2,300 synthetic beats, using the functions
-lifted out of the edited source:
+One constant. `WAVELET_TARGET_FREQS_HZ` goes from linear to log-spaced:
 
-```
-A) the code path, from AST
-   ORIGINAL beat  (extract_beats_from_record):
-      line 603   normalize_segment
-      line 608   cwt_ricker
-   AUGMENTED beat (augment_training_data -> augment_segment):
-      line 730   normalize_segment   (inside augment_segment)
-      line 790   augment_segment
-      line 792   cwt_ricker
+```python
+WAVELET_F_MIN_HZ = 3.0
+WAVELET_F_MAX_HZ = 90.0
+N_WAVELET_SCALES_TARGET = 9
 
-   both paths end: ... -> normalize_segment -> cwt_ricker -> (234, 9)
-   [PASS] augment_segment no longer sees a scalogram (no cwt_ricker in it)
-   [PASS] augment_segment still ends with normalize_segment
-   [PASS] augment_training_data applies cwt_ricker AFTER augment_segment
-   [PASS] augment_training_data makes no normalize_segment CALL of its own
-   [PASS] augment_segment makes exactly one normalize_segment call
-   [PASS] extract_beats_from_record: normalize_segment then cwt_ricker, once each
-
-B) per-channel statistics on a real record
-   record 209: X (3004, 234, 9)  X_raw (3004, 234)
-   after augmentation: (5304, 234, 9)  (3004 originals + 2300 synthetic)
-
-    ch centre Hz | orig mean  orig std |  aug mean   aug std |   d mean  std rat
-     0      10.0 |    0.0078    2.6033 |    0.0035    2.6068 |   0.0044    1.001
-     1      20.0 |    0.0060    2.1701 |    0.0041    2.1728 |   0.0019    1.001
-     2      30.0 |    0.0030    1.4867 |    0.0022    1.4876 |   0.0008    1.001
-     3      40.0 |    0.0018    0.9874 |    0.0014    0.9873 |   0.0005    1.000
-     4      50.0 |    0.0012    0.6763 |    0.0010    0.6759 |   0.0003    0.999
-     5      60.0 |    0.0008    0.4831 |    0.0007    0.4827 |   0.0001    0.999
-     6      70.0 |    0.0006    0.3580 |    0.0006    0.3577 |   0.0001    0.999
-     7      80.0 |    0.0005    0.2734 |    0.0004    0.2732 |   0.0001    0.999
-     8      90.0 |    0.0004    0.2163 |    0.0004    0.2162 |   0.0000    1.000
-
-   worst |log(std ratio)| across channels : 0.0014 (1.00x ratio would be 0.0)
-   worst |mean difference| in orig-std units: 0.0017
-
-   for contrast - the pre-fix path (perturb the scalogram, then
-   global z-score over all 234x9 values):
-    ch |  orig std old-aug std |     ratio
-     0 |    2.5765    1.9637 |     0.762
-     1 |    2.1358    1.6243 |     0.761
-     2 |    1.5024    1.1422 |     0.760
-     3 |    1.0162    0.7726 |     0.760
-     4 |    0.7050    0.5363 |     0.761
-     5 |    0.5090    0.3874 |     0.761
-     6 |    0.3794    0.2891 |     0.762
-     7 |    0.2904    0.2215 |     0.763
-     8 |    0.2314    0.1768 |     0.764
-
-   [PASS] every channel std ratio within 0.85 - 1.18
-
-   [PASS] every channel mean within 0.10 orig-std
-
-   [PASS] augmented shape matches originals
-
-   [PASS] no NaN / inf in augmented
-
-   [PASS] counts: S x7, V x3
-
-OVERALL: PASS
+WAVELET_TARGET_FREQS_HZ = [
+    float(
+        WAVELET_F_MIN_HZ
+        * (WAVELET_F_MAX_HZ / WAVELET_F_MIN_HZ)
+        ** (k / (N_WAVELET_SCALES_TARGET - 1.0))
+    )
+    for k in range(N_WAVELET_SCALES_TARGET)
+]
 ```
 
-**Every channel now matches to within 0.1%.** Std ratios run 0.999 to 1.001;
-the worst mean difference is 0.0017 in units of the original std.
-
-**For contrast, the pre-fix path** put augmented beats at a **uniform 0.76x**
-the original std in every channel - the global z-score over 234x9 values
-divided everything by roughly the same factor. That is a 24% amplitude
-mismatch applied to 4,020 of 4,690 S training samples, on the one class E2
-exists to improve. It is the step 1b failure mode again, and it is now gone.
+Computed, not hardcoded. The widths come from the **same**
+`ricker_width_for_frequency` already in the code - that function is
+byte-identical, as is `cwt_ricker`. The section 6B print already reports
+targets, widths, centre frequencies and support lengths, so no print change
+was needed.
 
 ---
 
@@ -142,117 +65,223 @@ exists to improve. It is the step 1b failure mode again, and it is now gone.
 
 **py_compile** - passed, exit code 0.
 
-**`ast.dump` against E2 as committed:**
+**`ast.dump` against E2 HEAD:**
 
 ```
-changed : ['augment_segment', 'augment_training_data',
-           'extract_beats_from_record', 'load_dataset']
+changed : NONE
 added   : NONE
 removed : NONE
-unexpected: NONE
+classes changed: NONE
 ```
 
-All four were expected: two to carry the raw waveform, two to change where
-the perturbation happens.
+**Zero functions changed.** The entire source diff outside comments is one
+deleted line and the eleven-line replacement above:
 
-**`augment_segment` is now AST-identical to its E1 version** - the
-`axis=0` I added for the scalogram is gone because it no longer sees one. The
-perturbation logic is bit-for-bit what it was before E2, which is exactly what
-a clean one-variable ablation needs.
+```diff
+-WAVELET_TARGET_FREQS_HZ = [float(10 * k) for k in range(1, 10)]
++WAVELET_F_MIN_HZ = 3.0
++WAVELET_F_MAX_HZ = 90.0
++N_WAVELET_SCALES_TARGET = 9
++WAVELET_TARGET_FREQS_HZ = [ ... ]
+```
 
-**`build_model` is byte-identical to both E2-as-committed and E1.**
+This is as clean as a one-variable ablation gets.
 
-**Constants** all present exactly once and unchanged: `PRE_SAMPLES = 90`,
+**Measurements on record 209:**
+
+```
+A) scale set
+    ch   target Hz    width a   centre Hz   support truncated
+     0      3.0000    27.0095      3.0000       234       YES
+     1      4.5895    17.6553      4.5895       176        no
+     2      7.0210    11.5408      7.0210       115        no
+     3     10.7409     7.5439     10.7409        75        no
+     4     16.4317     4.9312     16.4317        49        no
+     5     25.1375     3.2234     25.1375        32        no
+     6     38.4558     2.1071     38.4558        21        no
+     7     58.8305     1.3773     58.8305        13        no
+     8     90.0000     0.9003     90.0000         9        no
+
+   empirical FFT peak of each discretised wavelet:
+    ch   target Hz   FFT peak Hz      err %
+     0      3.0000        3.0103      0.34%
+     1      4.5895        4.5923      0.06%
+     2      7.0210        7.0312      0.15%
+     3     10.7409       10.7446      0.03%
+     4     16.4317       16.4355      0.02%
+     5     25.1375       25.1367      0.00%
+     6     38.4558       38.4521      0.01%
+     7     58.8305       58.8208      0.02%
+     8     90.0000       90.3735      0.42%
+
+B) the 3 Hz channel, where the support is truncated
+   width a = 27.0095   untruncated support = 270   used = 234  (cap 234)
+   envelope at the truncation edge, relative to peak: 9.122e-05
+   wavelet sum (admissibility, ideally 0):
+     untruncated +1.691902e-04   truncated +3.285266e-03
+     truncated sum as a fraction of peak |amplitude|: 1.970e-02
+   energy retained by truncation: 99.999958%
+
+C) scalogram on record 209
+   X (3004, 234, 9)  dtype float32
+   NaN: False   inf: False
+   channel 0 (3 Hz) NaN: False  inf: False  min -10.9393  max 12.8413
+
+    ch   centre Hz        min        max        std
+     0        3.00   -10.9393    12.8413     2.6516
+     1        4.59   -10.1253    11.0011     2.8981
+     2        7.02    -7.5971    11.4178     2.6765
+     3       10.74    -9.0580    13.1331     2.6118
+     4       16.43   -10.1064    13.9030     2.4403
+     5       25.14    -9.4066    12.8038     1.8286
+     6       38.46    -7.6175     9.6044     1.0478
+     7       58.83    -4.7937     5.3866     0.4926
+     8       90.00    -2.3716     3.3636     0.2086
+
+   9x9 channel correlation matrix:
+            3.0     4.6     7.0    10.7    16.4    25.1    38.5    58.8    90.0
+     3.0  1.0000  0.8623  0.5417  0.2480  0.1050  0.0526  0.0339  0.0268  0.0241
+     4.6  0.8623  1.0000  0.8183  0.4491  0.2082  0.1077  0.0690  0.0531  0.0454
+     7.0  0.5417  0.8183  1.0000  0.7987  0.4712  0.2736  0.1856  0.1444  0.1221
+    10.7  0.2480  0.4491  0.7987  1.0000  0.8426  0.6012  0.4542  0.3689  0.3159
+    16.4  0.1050  0.2082  0.4712  0.8426  1.0000  0.8977  0.7747  0.6685  0.5874
+    25.1  0.0526  0.1077  0.2736  0.6012  0.8977  1.0000  0.9374  0.8598  0.7775
+    38.5  0.0339  0.0690  0.1856  0.4542  0.7747  0.9374  1.0000  0.9731  0.9096
+    58.8  0.0268  0.0531  0.1444  0.3689  0.6685  0.8598  0.9731  1.0000  0.9755
+    90.0  0.0241  0.0454  0.1221  0.3159  0.5874  0.7775  0.9096  0.9755  1.0000
+
+   max |off-diagonal correlation| : 0.9755  (ch 7 @ 58.8 Hz vs ch 8 @ 90.0 Hz)
+   E2 (linear 10-90 Hz) was          : 0.9968  (60 Hz vs 70 Hz)
+   change: -0.0213
+   top 3 correlated pairs:
+     0.9755  ch7 (58.8 Hz) - ch8 (90.0 Hz)
+     0.9731  ch6 (38.5 Hz) - ch7 (58.8 Hz)
+     0.9374  ch5 (25.1 Hz) - ch6 (38.5 Hz)
+   mean |off-diagonal|: 0.4607
+
+   std ratio max/min across channels: 13.89  (E2: 12.55)
+```
+
+**Constants unchanged** (one occurrence each): `PRE_SAMPLES = 90`,
 `POST_SAMPLES = 144`, `FOCAL_ALPHA = 0.50`, `FOCAL_GAMMA = 2.0`,
 `ADAM_LEARNING_RATE = 1e-4`, `RR_LOCAL_WINDOW = 10`, `RR_CLIP_MIN = 0.2`,
-`RR_CLIP_MAX = 3.0`, `SAMPLING_RATE_HZ = 360.0`.
-
-**Augmentation multipliers** `[0, 6, 2, 0]` - identical to E2 and to E1.
-Confirmed empirically too: the augmented set has exactly 7x the S beats and
-3x the V beats of the original, with N unchanged.
-
-**RR features and record lists**: the `rr = [...]` block and
-`RR_FEATURE_NAMES` byte-identical; `DS1` `9f20e3ac1758a312...`, `DS2`
-`b8a3e6bbdeeec72a...`, `DS1_VAL` `0d9df3612a6111a1...` =
-`['207','220','223']`. The wavelet target frequencies are unchanged.
+`RR_CLIP_MAX = 3.0`, `SAMPLING_RATE_HZ = 360.0`. Augmentation multipliers
+`[0, 6, 2, 0]` identical. The `rr = [...]` block and `RR_FEATURE_NAMES`
+byte-identical. `DS1` `9f20e3ac1758a312...`, `DS2` `b8a3e6bbdeeec72a...`,
+`DS1_VAL` `0d9df3612a6111a1...` = `['207','220','223']`. `build_model`
+byte-identical, so the model is unchanged: first Conv1D `5*9*32 + 32 = 1472`,
+total **239,171**.
 
 ---
 
-## Noted for later: the 60 Hz channels
+## The truncation question
 
-You are almost certainly right that this is mains. MIT-BIH was recorded at
-the BIH in Boston on US mains at **60 Hz**, and channels 5 and 6 sit at 60 and
-70 Hz with `|r| = 0.9968`. Two things point the same way:
+You flagged it correctly, and it engages on exactly one channel.
 
-- The 60 Hz channel has no local prominence in the energy profile - std falls
-  monotonically 2.62 -> 0.21 from 10 to 90 Hz, so whatever 60 Hz content
-  exists is riding a smoothly decaying envelope rather than standing out as
-  cardiac structure.
-- The MIT-BIH signals were digitised from analogue tape with a passband of
-  roughly 0.1-100 Hz and no notch filter documented per record, so residual
-  mains is expected rather than surprising.
+The 3 Hz scale has width `a = 27.0095`, so its untruncated support would be
+`10a = 270` samples against a 234-sample window. `cwt_ricker` caps it at 234.
+The consequences, measured:
 
-**No action taken** - the 9 scales stay as they are so this remains a clean
-match to Zahid et al.'s 10-90 Hz range. Recorded here as a candidate for a
-later step: a 50/60/70 Hz notch before the CWT, or dropping to 6-7 scales that
-skip the mains neighbourhood, would test whether those channels carry signal
-or interference. Worth doing only after E2 has a number.
+- **Envelope at the truncation edge: 9.12e-05 of peak.** The cut lands far out
+  in the Gaussian tail.
+- **Energy retained: 99.999958%.**
+- The one real side effect is admissibility. A Ricker wavelet should sum to
+  zero; truncation breaks that slightly. The sum goes from `+1.69e-04`
+  (untruncated) to `+3.29e-03` (truncated) - a 19x increase, but still only
+  **1.97e-02 of peak amplitude**, and the mean per sample is 1.4e-05 against a
+  peak of 0.167. Since every beat is z-scored to zero mean before the CWT, the
+  DC that this non-zero sum would pass is already approximately zero.
+
+**The channel is not degenerate:** std 2.6516, range -10.94 to 12.84, no NaN,
+no inf, and it is the *least* correlated channel with the rest (0.0241 against
+90 Hz).
+
+---
+
+## Does log spacing decorrelate the set?
+
+**Yes, but the improvement is at the low end, not the top.**
+
+- **Max off-diagonal correlation: 0.9755** (58.8 vs 90.0 Hz), down from E2's
+  **0.9968** (60 vs 70 Hz). A change of **-0.0213**.
+- Mean off-diagonal correlation 0.4607, against a much more uniform structure
+  in E2.
+- The correlation matrix now has clear band structure: adjacent scales
+  correlate, distant ones do not. 3 Hz against 90 Hz is **0.0241** - nearly
+  independent. In E2 the low and high ends were far more entangled.
+
+**But the top three pairs are still above 0.93** (0.9755, 0.9731, 0.9374).
+Log spacing compresses the high end - 38.5, 58.8 and 90 Hz sit closer in
+*width* terms (1.49, 0.98, 0.90 samples) than the linear set did. So the
+redundancy you identified has moved rather than vanished: it is no longer two
+channels at 60/70 Hz, it is a smoother gradient across the top three.
+
+Channel std is now much flatter across the informative band: 2.65, 2.90, 2.68,
+2.61, 2.44, 1.83, 1.05, 0.49, 0.21. The **4.59 Hz channel now carries the most
+energy of any scale (std 2.8981)** - which is where P- and T-wave content
+lives, and is the point of the change. The max/min std ratio is 13.89 against
+E2's 12.55, slightly worse only because the 90 Hz channel is unchanged while
+the low end got stronger.
 
 ---
 
 ## Falsifiable predictions
 
-Unchanged from E2, since nothing about the split, the multipliers or the
-architecture moved:
+1. **425 steps/epoch and 239,171 total parameters**, both unchanged from E2.
+   The channel count did not move, so if either differs, something other than
+   the scale set changed.
+2. **`config.wavelet_centre_frequencies` will be**
+   `[3.00, 4.59, 7.02, 10.74, 16.43, 25.14, 38.46, 58.83, 90.00]` to 2 dp,
+   with `wavelet_scales` running 27.0095 down to 0.9003.
+3. **S-F1 will exceed E2's 0.2686.** This is the actual bet, and the
+   reasoning is the physiological one: four channels now sit at or below 10.74
+   Hz where P-wave energy lives, against zero in E2. **If S-F1 does not move,
+   the missing-P-wave hypothesis is wrong and the S problem is not a
+   frequency-coverage problem.**
+4. **V-F1 will drop somewhat from 0.9111.** E2 spent five channels between 50
+   and 90 Hz on the wide-QRS morphology that V detection relies on; E3 spends
+   two. I would be surprised by a collapse, but a few points of V-F1 is the
+   price being paid for the low-frequency coverage.
 
-1. **425 steps/epoch**; `train_distribution` N=40301 / S=670 / V=3105.
-2. **First Conv1D reports 1,472 parameters**; total **239,171**.
-3. `config.wavelet_centre_frequencies` = `[10, 20, ..., 90]`.
-
-New to this fix:
-
-4. **E2's result is now interpretable as a one-variable ablation against E1's
-   argmax 0.6645.** Before the fix it was not - 85.7% of S training samples
-   were mis-scaled. If E2 still underperforms E1 after this, the wavelet
-   representation itself is the thing that did not help, and that conclusion
-   is now sound.
+Prediction 3 is the experiment. Prediction 4 is the cost. If both land, the
+right follow-up is more scales rather than re-spaced ones.
 
 ---
 
 ## Commit
 
 ```
-11cd348  E2 fix: identical normalization path for original and augmented beats
+fe14c34  E3: log-spaced wavelet scales 3-90 Hz
 ```
 
-Pushed to `origin/main`.
+Pushed to `origin/main`. `docs/ablation.md` now carries 10 runs including E2.
 
 ---
 
 ## Problems
 
-1. **`X_raw` costs memory and is computed for sets that never use it.**
-   `load_dataset` builds a `(n, 234)` float32 array for validation and test
-   too, which the call sites discard with `_`. That is ~46 MB for DS2 and ~6
-   MB for validation - small next to the 415 MB scalogram, but genuinely
-   wasted. I kept the signature uniform rather than adding a flag, because a
-   `return_raw=` parameter is more surface area than the memory is worth.
+1. **The high end is still redundant.** 0.9755 between 58.8 and 90 Hz is
+   better than 0.9968 but not good. If E3's V-F1 drops as predicted, the
+   diagnosis is that we are simultaneously under-resolving the QRS band and
+   wasting channels inside it - which argues for more than 9 scales rather
+   than a different 9.
 
-2. **Augmented beats are still not perfectly identical in path to originals** -
-   they go `raw -> z-score -> perturb -> z-score -> CWT`, originals go
-   `raw -> z-score -> CWT`. The second z-score is inherent to how
-   `augment_segment` has always worked (it renormalises after adding noise and
-   scaling), and it is what the task specified. The measured result is that
-   this makes no meaningful difference: per-channel stats match to 0.1%.
-   Worth knowing it is a same-tail equivalence, not a literally identical call
-   sequence.
+2. **The 3 Hz wavelet is mildly non-admissible** after truncation (sum
+   3.29e-03 rather than 0). Harmless here because the input is z-scored, but
+   worth knowing if the pre-CWT normalization is ever removed.
 
-3. **The channel std disparity remains** - 12.55x from the 10 Hz channel to
-   the 90 Hz one. The fix aligned augmented beats with originals; it did not
-   equalise the scales relative to each other. If E2 underperforms,
-   per-channel normalisation is the first thing to try, and it would now be
-   safe to add in one place because both paths share the tail.
+3. **E2's `best_epoch` was 1 and it still produced the best test score.** That
+   is the third run selected at a very early epoch. It worked this time, but
+   the validation signal is clearly not tracking test performance well - the
+   test-minus-validation gap is now **+0.1621**, the largest of any run.
+   Selection remains the weakest part of this pipeline and is worth a step of
+   its own.
 
-4. Carried over: hard constraint 2 still violated (augmentation on); record
+4. **Threshold tuning has now failed to transfer twice** (E1: -0.0495; E2:
+   -0.0846). Two failures on the same mechanism is a pattern, not noise. The
+   argmax column remains the honest comparison, which is what the table
+   reports. Worth considering whether to stop running the search.
+
+5. Carried over: hard constraint 2 still violated (augmentation on); record
    114 lead swap unfixed; record 207 still a validation outlier;
    `tools/inspect_ds1.py` JSON stale; stale root `__pycache__/`.
