@@ -25,6 +25,8 @@ DS2. All metrics below are on DS2 (inter-patient test set).
 | 3 | patient-relative RR ratio features (5 dimensionless) | `1a2509c` | 0.6645 | 0.1514 | 0.3634 | 0.2138 | 0.8004 | 0.9451 |
 | 4 | remove oversampling, per-class focal alpha | `3b67016` | 0.5599 | 0.1106 | 0.2016 | 0.1428 | 0.5895 | 0.8892 |
 | 5 | enlarge DS1_VAL to 5 records | `7b0236d` | 0.5408 | 0.0708 | 0.1506 | 0.0963 | 0.5745 | 0.8919 |
+| E0 | re-anchor: step 3 training config, 5-record validation | `042597b` | 0.5591 | 0.0964 | 0.1758 | 0.1245 | 0.6002 | 0.8935 |
+| E1 | revert DS1_VAL to 3 records + validation-tuned thresholds | `3d3494b` | 0.6645 | 0.1514 | 0.3634 | 0.2138 | 0.8004 | 0.9451 |
 
 ## Notes
 
@@ -57,6 +59,16 @@ DS2. All metrics below are on DS2 (inter-patient test set).
 
   **The step 3 condition (macro-F1 above 0.6800) still fails**, but with V over-prediction this severe the feature question and the class-weighting question are not separable. It carries forward to step 6.
 
+- **step E0** (`E0_reanchor`) - train distribution N=36631 / S=574 / V=2569. Ran 12 epochs; selection on `val_macro_f1` chose **epoch 2** (best val macro-F1 0.5911); early stopping fired: True.
+  **Failed its 0.6400 criterion at 0.5591.** Training code identical to step 3; the ONLY difference was the 5-record validation set, and it selected epoch 2 instead of step 3's epoch 8. Cause, visible in this run's own history: `val_f1_V` peaks at epoch 2 (0.6617) while `val_f1_S` is still climbing at epoch 6 (0.2869), so macro-F1 tracks V and stops early. Record 106 contributes 520 V beats and ZERO S. This is what motivated the E1 revert.
+
+- **step E1** (`E1_threshold_tuning`) - train distribution N=40301 / S=670 / V=3105. Ran 18 epochs; selection on `val_macro_f1` chose **epoch 8** (best val macro-F1 0.5618); early stopping fired: True.
+  **The argmax column above is E1's plain-argmax result, and it reproduces step 3 EXACTLY** - confusion matrix identical (`True`), same `best_epoch` 8, same macro-F1 0.6645. That confirms the E1 revert restored the step 3 configuration bit for bit and that the pipeline is deterministic.
+
+  **Threshold tuning did not transfer.** Coordinate ascent on validation chose w = [1.0, 4.0, 4.0] (N, S, V), lifting VALIDATION macro-F1 0.5618 -> 0.6207. On DS2 the same weights made things worse: macro-F1 0.6645 -> 0.6150, accuracy 0.9451 -> 0.8697.
+
+  It did exactly what it was asked to: **S recall 0.1514 -> 0.3028**, roughly double. But S precision collapsed 0.3634 -> 0.1199, because upweighting S by 4x moved 3990 true N beats into the S column. The search also raised w_V to 4.0, so N F1 fell 0.9793 -> 0.9372 as well. Tuning both minority classes on 273 validation S beats overfitted the validation set.
+
 ## Test-minus-validation gap
 
 A model selected on a trustworthy validation signal should not score wildly
@@ -68,6 +80,8 @@ differently on test. The gap is `test macro-F1 - best_val_macro_f1`:
 | 3 | 0.5618 | 0.6645 | +0.1027 |
 | 4 | 0.7288 | 0.5599 | -0.1689 |
 | 5 | 0.6025 | 0.5408 | -0.0617 |
+| E0 | 0.5911 | 0.5591 | -0.0320 |
+| E1 | 0.5618 | 0.6645 | +0.1027 |
 
 Steps 2 and 3 scored **above** validation, which is the expected direction
 when validation holds only three patients and two of them are hard. Step 4 is

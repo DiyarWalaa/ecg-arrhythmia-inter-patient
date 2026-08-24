@@ -107,6 +107,29 @@ RUNS = [
       "config.ds1_val": ["106", "118", "207", "220", "223"],
       "config.oversampling": False},
      None),          # assembled from the artefacts - see step5_note()
+
+    ("E0", "E0_reanchor", "042597b",
+     "re-anchor: step 3 training config, 5-record validation",
+     {"run_name": "E0_reanchor",
+      "config.ds1_val": ["106", "118", "207", "220", "223"],
+      "config.oversampling": True,
+      "config.focal_loss_alpha": 0.5},
+     "**Failed its 0.6400 criterion at 0.5591.** Training code identical to "
+     "step 3; the ONLY difference was the 5-record validation set, and it "
+     "selected epoch 2 instead of step 3's epoch 8. Cause, visible in this "
+     "run's own history: `val_f1_V` peaks at epoch 2 (0.6617) while "
+     "`val_f1_S` is still climbing at epoch 6 (0.2869), so macro-F1 tracks "
+     "V and stops early. Record 106 contributes 520 V beats and ZERO S. "
+     "This is what motivated the E1 revert."),
+
+    ("E1", "E1_threshold_tuning", "3d3494b",
+     "revert DS1_VAL to 3 records + validation-tuned thresholds",
+     {"run_name": "E1_threshold_tuning",
+      "config.ds1_val": ["207", "220", "223"],
+      "config.oversampling": True,
+      "config.focal_loss_alpha": 0.5,
+      "threshold_weights": lambda v: isinstance(v, list) and len(v) == 3},
+     None),          # assembled from the artefacts - see e1_note()
 ]
 
 
@@ -223,7 +246,44 @@ def step5_note(m, h, gaps):
              pv=pred_v, tv=true_v, over=100.0 * (pred_v - true_v) / true_v)
 
 
-ASSEMBLED = {"4": step4_note, "5": step5_note}
+def e1_note(m, h, gaps):
+    """E1 carries two decision rules, so its note reports both."""
+    a = m["test_argmax"]["classification_report"]
+    t = m["test_tuned"]["classification_report"]
+    w = m["threshold_weights"]
+    s3 = json.load(open(os.path.join(RESULTS, "step3_rr_ratios",
+                                     "metrics.json")))
+    reproduced = (m["test_argmax"]["confusion_matrix"]
+                  == s3["confusion_matrix"])
+    return (
+        "**The argmax column above is E1's plain-argmax result, and it "
+        "reproduces step 3 EXACTLY** - confusion matrix identical "
+        "(`{rep}`), same `best_epoch` {be}, same macro-F1 {mf1:.4f}. That "
+        "confirms the E1 revert restored the step 3 configuration bit for "
+        "bit and that the pipeline is deterministic.\n\n"
+        "  **Threshold tuning did not transfer.** Coordinate ascent on "
+        "validation chose w = {w} (N, S, V), lifting VALIDATION macro-F1 "
+        "{v0:.4f} -> {v1:.4f}. On DS2 the same weights made things worse: "
+        "macro-F1 {ta:.4f} -> {tt:.4f}, accuracy {aa:.4f} -> {at:.4f}.\n\n"
+        "  It did exactly what it was asked to: **S recall {ra:.4f} -> "
+        "{rt:.4f}**, roughly double. But S precision collapsed {pa:.4f} -> "
+        "{pt:.4f}, because upweighting S by 4x moved {fp} true N beats into "
+        "the S column. The search also raised w_V to 4.0, so N F1 fell "
+        "{na:.4f} -> {nt:.4f} as well. Tuning both minority classes on 273 "
+        "validation S beats overfitted the validation set."
+    ).format(rep=reproduced, be=m["best_epoch"],
+             mf1=a["macro avg"]["f1-score"], w=[round(x, 4) for x in w],
+             v0=m["threshold_val_macro_f1_argmax"],
+             v1=m["threshold_val_macro_f1"],
+             ta=a["macro avg"]["f1-score"], tt=t["macro avg"]["f1-score"],
+             aa=m["test_argmax"]["accuracy"], at=m["test_tuned"]["accuracy"],
+             ra=a["S"]["recall"], rt=t["S"]["recall"],
+             pa=a["S"]["precision"], pt=t["S"]["precision"],
+             fp=m["test_tuned"]["confusion_matrix"][0][1],
+             na=a["N"]["f1-score"], nt=t["N"]["f1-score"])
+
+
+ASSEMBLED = {"4": step4_note, "5": step5_note, "E1": e1_note}
 
 
 # --------------------------------------------------------------------- build
