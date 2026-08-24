@@ -538,6 +538,13 @@ def extract_beats_from_record(
     labels = []
     rr_features = []
 
+    # The z-scored raw waveform is kept alongside the scalogram so that
+    # augmentation can perturb the WAVEFORM and then re-enter the exact
+    # same normalize -> CWT tail the originals went through. Without it,
+    # augmentation would have to perturb the scalogram, which is what
+    # put augmented beats on a different scale from test beats.
+    raw_beats = []
+
     for i in range(1, len(ann_samples) - 1):
 
         r_peak = ann_samples[i]
@@ -595,6 +602,8 @@ def extract_beats_from_record(
 
         segment = normalize_segment(segment)
 
+        raw_beats.append(segment.astype(np.float32))
+
         # (SEGMENT_LENGTH,) -> (SEGMENT_LENGTH, N_WAVELET_SCALES)
         segment = cwt_ricker(
             segment,
@@ -609,7 +618,7 @@ def extract_beats_from_record(
 
         rr_features.append(rr)
 
-    return beats, labels, rr_features
+    return beats, labels, rr_features, raw_beats
 
 
 # =========================================================
@@ -627,12 +636,13 @@ def load_dataset(
     all_beats = []
     all_labels = []
     all_rr = []
+    all_raw = []
 
     for rec in record_list:
 
         print(f"Loading record {rec} ...")
 
-        beats, labels, rr = extract_beats_from_record(
+        beats, labels, rr, raw = extract_beats_from_record(
             rec,
             data_dir,
             pre_samples,
@@ -646,6 +656,8 @@ def load_dataset(
 
         all_rr.extend(rr)
 
+        all_raw.extend(raw)
+
     X = np.array(
         all_beats,
         dtype=np.float32
@@ -658,7 +670,12 @@ def load_dataset(
         dtype=np.float32
     )
 
-    return X, y, RR
+    X_raw = np.array(
+        all_raw,
+        dtype=np.float32
+    )
+
+    return X, y, RR, X_raw
 
 
 # =========================================================
@@ -691,9 +708,7 @@ def augment_segment(segment):
 
         if shift != 0:
 
-            # axis=0 is time; without it np.roll would flatten the
-            # (time, scale) array and mix channels.
-            x = np.roll(x, shift, axis=0)
+            x = np.roll(x, shift)
 
             if shift > 0:
                 x[:shift] = x[shift]
@@ -730,19 +745,28 @@ def augment_segment(segment):
 
 def augment_training_data(
     X,
+    X_raw,
     RR,
     y
 ):
+    """Expand the minority classes with perturbed copies.
+
+    X      - (n, SEGMENT_LENGTH, N_WAVELET_SCALES) scalograms, the
+             originals, already produced by normalize -> CWT in section 7.
+    X_raw  - (n, SEGMENT_LENGTH) z-scored waveforms for the same beats.
+
+    Augmentation perturbs the WAVEFORM and then runs the identical
+    normalize -> CWT tail the originals went through, so every sample the
+    model sees - original or synthetic, train or test - reaches the
+    network by the same route. Perturbing the scalogram instead put 85.7%
+    of S training samples on a different scale from every test beat.
+    """
 
     X_list = [X]
     RR_list = [RR]
     y_list = [y]
 
-    for sample, rr, label in zip(X, RR, y):
-
-        # sample is (SEGMENT_LENGTH, N_WAVELET_SCALES); the channel
-        # axis is real now, so there is nothing to squeeze.
-        segment = sample
+    for segment, rr, label in zip(X_raw, RR, y):
 
         # N
         if label == 0:
@@ -761,7 +785,14 @@ def augment_training_data(
 
         for _ in range(multiplier):
 
+            # Identical tail to the originals: normalize_segment is
+            # applied inside augment_segment, then the same cwt_ricker.
             aug = augment_segment(segment)
+
+            aug = cwt_ricker(
+                aug,
+                WAVELET_WIDTHS
+            ).T.astype(np.float32)
 
             X_list.append(
                 aug[np.newaxis, ...]
@@ -962,7 +993,7 @@ def tune_decision_weights(y_prob, y_true_int, num_classes, grid,
 
 print("Loading DS1_TRAIN (train) ...")
 
-X_train, y_train, RR_train = load_dataset(
+X_train, y_train, RR_train, X_raw_train = load_dataset(
     DS1_TRAIN,
     DATA_DIR,
     PRE_SAMPLES,
@@ -984,7 +1015,7 @@ val_record_ids = []
 
 for rec in DS1_VAL:
 
-    X_rec, y_rec, RR_rec = load_dataset(
+    X_rec, y_rec, RR_rec, _ = load_dataset(
         [rec],
         DATA_DIR,
         PRE_SAMPLES,
@@ -1006,7 +1037,7 @@ val_record_ids = np.array(val_record_ids)
 
 print("\nLoading DS2 (test) ...")
 
-X_test, y_test, RR_test = load_dataset(
+X_test, y_test, RR_test, _ = load_dataset(
     DS2,
     DATA_DIR,
     PRE_SAMPLES,
@@ -1166,6 +1197,7 @@ print(f"\nTrain beats: {len(y_tr)}   Validation beats: {len(y_val)}")
 
 X_tr_aug, RR_tr_aug, y_tr_aug = augment_training_data(
     X_tr,
+    X_raw_train,
     RR_tr,
     y_tr
 )
