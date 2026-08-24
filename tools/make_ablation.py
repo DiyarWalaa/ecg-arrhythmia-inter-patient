@@ -130,6 +130,15 @@ RUNS = [
       "config.focal_loss_alpha": 0.5,
       "threshold_weights": lambda v: isinstance(v, list) and len(v) == 3},
      None),          # assembled from the artefacts - see e1_note()
+
+    ("E2", "E2_wavelet_input", "11cd348",
+     "9-scale wavelet scalogram input (linear 10-90 Hz)",
+     {"run_name": "E2_wavelet_input",
+      "config.ds1_val": ["207", "220", "223"],
+      "config.wavelet_centre_frequencies":
+          lambda v: isinstance(v, list) and len(v) == 9
+          and abs(v[0] - 10.0) < 1e-6 and abs(v[-1] - 90.0) < 1e-6},
+     None),          # assembled from the artefacts - see e2_note()
 ]
 
 
@@ -283,7 +292,45 @@ def e1_note(m, h, gaps):
              na=a["N"]["f1-score"], nt=t["N"]["f1-score"])
 
 
-ASSEMBLED = {"4": step4_note, "5": step5_note, "E1": e1_note}
+def e2_note(m, h, gaps):
+    """E2's story is in the confusion matrix, not the headline number."""
+    a = m["test_argmax"]["classification_report"]
+    t = m["test_tuned"]["classification_report"]
+    cm = m["test_argmax"]["confusion_matrix"]
+    e1 = json.load(open(os.path.join(RESULTS, "E1_threshold_tuning",
+                                     "metrics.json")))
+    e1a = e1["test_argmax"]["classification_report"]
+    e1cm = e1["test_argmax"]["confusion_matrix"]
+    return (
+        "**Best result of any run: macro-F1 {mf1:.4f}** (argmax), against "
+        "E1's {p:.4f}. The gain is almost entirely V: **V-F1 {v0:.4f} -> "
+        "{v1:.4f}, V precision {vp0:.4f} -> {vp1:.4f}**. Confusion with V "
+        "collapsed - N-called-V {a0} -> {a1}, S-called-V {b0} -> {b1}.\n\n"
+        "  **S barely moved: S-F1 {s0:.4f} -> {s1:.4f}.** A V beat is "
+        "identified by a wide QRS, which a 10-90 Hz view captures well; an "
+        "S beat is identified by an abnormal or absent P-wave plus early "
+        "timing, and P-wave energy lies largely BELOW 10 Hz. This scale set "
+        "has no channel under 10 Hz. That motivated E3.\n\n"
+        "  Two caveats. `best_epoch` is **{be}** - the same one-epoch "
+        "selection that confounded step 4, though here it produced the best "
+        "test score rather than the worst. And threshold tuning hurt again: "
+        "validation {tv0:.4f} -> {tv1:.4f} but test {mf1:.4f} -> {tt:.4f}, "
+        "the second run in a row where tuned weights failed to transfer.\n\n"
+        "  This run used the corrected normalization path (commit "
+        "`11cd348`): its timestamp is 21:43 UTC, 12 minutes after that fix "
+        "was committed at 21:31 UTC."
+    ).format(mf1=a["macro avg"]["f1-score"], p=e1a["macro avg"]["f1-score"],
+             v0=e1a["V"]["f1-score"], v1=a["V"]["f1-score"],
+             vp0=e1a["V"]["precision"], vp1=a["V"]["precision"],
+             a0=e1cm[0][2], a1=cm[0][2], b0=e1cm[1][2], b1=cm[1][2],
+             s0=e1a["S"]["f1-score"], s1=a["S"]["f1-score"],
+             be=m["best_epoch"],
+             tv0=m["threshold_val_macro_f1_argmax"],
+             tv1=m["threshold_val_macro_f1"],
+             tt=t["macro avg"]["f1-score"])
+
+
+ASSEMBLED = {"4": step4_note, "5": step5_note, "E1": e1_note, "E2": e2_note}
 
 
 # --------------------------------------------------------------------- build

@@ -217,19 +217,37 @@ POST_SAMPLES = 144
 
 SEGMENT_LENGTH = PRE_SAMPLES + POST_SAMPLES
 
-# Wavelet scalogram input (E2).
+# Wavelet scalogram input (E2; scales re-spaced at E3).
 #
-# The beat window stops being a raw (234, 1) waveform and becomes a
-# (234, 9) Mexican-hat (Ricker) scalogram. Zahid et al. 2022 reach S-F1
-# 0.8344 on this exact DS1/DS2 split with a structurally similar network
-# (230-sample window, late-fused RR features, 23,619 parameters); the
-# input representation is the one ingredient we can adopt directly.
+# The beat window is a (234, 9) Mexican-hat (Ricker) scalogram rather than
+# a raw (234, 1) waveform. Zahid et al. 2022 reach S-F1 0.8344 on this
+# exact DS1/DS2 split with a structurally similar network (230-sample
+# window, late-fused RR features, 23,619 parameters); the input
+# representation is the one ingredient we can adopt directly.
+#
+# E3 re-spaces the same 9 scales from linear 10..90 Hz to LOG-spaced
+# 3..90 Hz. E2's linear set had zero channels below 10 Hz, and P-wave
+# energy - the thing that distinguishes an S beat - lies largely below
+# that. It also spent two channels at 60 and 70 Hz that correlated at
+# 0.9968. Log spacing buys resolution at the low end and stops wasting it
+# at the top. The channel COUNT is unchanged, so the model is unchanged.
 #
 # Widths are DERIVED from these target centre frequencies, never
 # hardcoded - see section 6B.
 SAMPLING_RATE_HZ = 360.0
 
-WAVELET_TARGET_FREQS_HZ = [float(10 * k) for k in range(1, 10)]
+WAVELET_F_MIN_HZ = 3.0
+WAVELET_F_MAX_HZ = 90.0
+N_WAVELET_SCALES_TARGET = 9
+
+WAVELET_TARGET_FREQS_HZ = [
+    float(
+        WAVELET_F_MIN_HZ
+        * (WAVELET_F_MAX_HZ / WAVELET_F_MIN_HZ)
+        ** (k / (N_WAVELET_SCALES_TARGET - 1.0))
+    )
+    for k in range(N_WAVELET_SCALES_TARGET)
+]
 
 # Patient-relative RR features (step 3).
 # Raw RR intervals in samples are not comparable across patients: 280

@@ -27,6 +27,7 @@ DS2. All metrics below are on DS2 (inter-patient test set).
 | 5 | enlarge DS1_VAL to 5 records | `7b0236d` | 0.5408 | 0.0708 | 0.1506 | 0.0963 | 0.5745 | 0.8919 |
 | E0 | re-anchor: step 3 training config, 5-record validation | `042597b` | 0.5591 | 0.0964 | 0.1758 | 0.1245 | 0.6002 | 0.8935 |
 | E1 | revert DS1_VAL to 3 records + validation-tuned thresholds | `3d3494b` | 0.6645 | 0.1514 | 0.3634 | 0.2138 | 0.8004 | 0.9451 |
+| E2 | 9-scale wavelet scalogram input (linear 10-90 Hz) | `11cd348` | 0.7178 | 0.1972 | 0.4214 | 0.2686 | 0.9111 | 0.9503 |
 
 ## Notes
 
@@ -69,6 +70,15 @@ DS2. All metrics below are on DS2 (inter-patient test set).
 
   It did exactly what it was asked to: **S recall 0.1514 -> 0.3028**, roughly double. But S precision collapsed 0.3634 -> 0.1199, because upweighting S by 4x moved 3990 true N beats into the S column. The search also raised w_V to 4.0, so N F1 fell 0.9793 -> 0.9372 as well. Tuning both minority classes on 273 validation S beats overfitted the validation set.
 
+- **step E2** (`E2_wavelet_input`) - train distribution N=40301 / S=670 / V=3105. Ran 11 epochs; selection on `val_macro_f1` chose **epoch 1** (best val macro-F1 0.5557); early stopping fired: True.
+  **Best result of any run: macro-F1 0.7178** (argmax), against E1's 0.6645. The gain is almost entirely V: **V-F1 0.8004 -> 0.9111, V precision 0.6891 -> 0.9495**. Confusion with V collapsed - N-called-V 521 -> 95, S-called-V 866 -> 55.
+
+  **S barely moved: S-F1 0.2138 -> 0.2686.** A V beat is identified by a wide QRS, which a 10-90 Hz view captures well; an S beat is identified by an abnormal or absent P-wave plus early timing, and P-wave energy lies largely BELOW 10 Hz. This scale set has no channel under 10 Hz. That motivated E3.
+
+  Two caveats. `best_epoch` is **1** - the same one-epoch selection that confounded step 4, though here it produced the best test score rather than the worst. And threshold tuning hurt again: validation 0.5557 -> 0.5822 but test 0.7178 -> 0.6332, the second run in a row where tuned weights failed to transfer.
+
+  This run used the corrected normalization path (commit `11cd348`): its timestamp is 21:43 UTC, 12 minutes after that fix was committed at 21:31 UTC.
+
 ## Test-minus-validation gap
 
 A model selected on a trustworthy validation signal should not score wildly
@@ -82,6 +92,7 @@ differently on test. The gap is `test macro-F1 - best_val_macro_f1`:
 | 5 | 0.6025 | 0.5408 | -0.0617 |
 | E0 | 0.5911 | 0.5591 | -0.0320 |
 | E1 | 0.5618 | 0.6645 | +0.1027 |
+| E2 | 0.5557 | 0.7178 | +0.1621 |
 
 Steps 2 and 3 scored **above** validation, which is the expected direction
 when validation holds only three patients and two of them are hard. Step 4 is
