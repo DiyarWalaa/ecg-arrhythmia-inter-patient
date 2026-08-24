@@ -217,6 +217,20 @@ POST_SAMPLES = 144
 
 SEGMENT_LENGTH = PRE_SAMPLES + POST_SAMPLES
 
+# Wavelet scalogram input (E2).
+#
+# The beat window stops being a raw (234, 1) waveform and becomes a
+# (234, 9) Mexican-hat (Ricker) scalogram. Zahid et al. 2022 reach S-F1
+# 0.8344 on this exact DS1/DS2 split with a structurally similar network
+# (230-sample window, late-fused RR features, 23,619 parameters); the
+# input representation is the one ingredient we can adopt directly.
+#
+# Widths are DERIVED from these target centre frequencies, never
+# hardcoded - see section 6B.
+SAMPLING_RATE_HZ = 360.0
+
+WAVELET_TARGET_FREQS_HZ = [float(10 * k) for k in range(1, 10)]
+
 # Patient-relative RR features (step 3).
 # Raw RR intervals in samples are not comparable across patients: 280
 # samples is early for a 60 bpm patient and late for a 100 bpm one. Every
@@ -365,6 +379,114 @@ def apply_rr_norm(rr_array, mean, std):
 
 
 # =========================================================
+# 6B. WAVELET SCALOGRAM
+# =========================================================
+
+# scipy.signal.ricker and scipy.signal.cwt were deprecated in SciPy 1.12
+# and REMOVED in SciPy 1.15 (this machine runs 1.18, where neither
+# exists). Both are reimplemented below from the SciPy source so the
+# output is what scipy.signal.cwt(data, scipy.signal.ricker, widths)
+# would have produced, with no scipy dependency at all - numpy only.
+# That also removes any question of what SciPy version Kaggle ships.
+
+
+def ricker_wavelet(points, a):
+    """Mexican-hat wavelet - a faithful reimplementation of the removed
+    scipy.signal.ricker(points, a)."""
+
+    amplitude = 2.0 / (np.sqrt(3.0 * a) * (np.pi ** 0.25))
+
+    wsq = a ** 2.0
+
+    vec = np.arange(0, points) - (points - 1.0) / 2.0
+
+    xsq = vec ** 2.0
+
+    modulation = 1.0 - xsq / wsq
+
+    gauss = np.exp(-xsq / (2.0 * wsq))
+
+    return amplitude * modulation * gauss
+
+
+def ricker_width_for_frequency(freq_hz, fs_hz):
+    """Width `a` whose Ricker wavelet peaks at freq_hz.
+
+    The Ricker spectrum is |psi(w)| proportional to w^2 exp(-a^2 w^2 / 2),
+    which is maximal where d/dw of that is zero, i.e. 2 - a^2 w^2 = 0, so
+    w_peak = sqrt(2) / a. Converting angular to cyclic frequency at a
+    sampling rate of fs:
+
+        f_peak = fs * sqrt(2) / (2 * pi * a)
+        =>  a  = fs * sqrt(2) / (2 * pi * f_peak)
+    """
+
+    return fs_hz * np.sqrt(2.0) / (2.0 * np.pi * freq_hz)
+
+
+def ricker_centre_frequency(a, fs_hz):
+    """Inverse of the above - the centre frequency a given width yields."""
+
+    return fs_hz * np.sqrt(2.0) / (2.0 * np.pi * a)
+
+
+def cwt_ricker(data, widths):
+    """Continuous wavelet transform - a faithful reimplementation of the
+    removed scipy.signal.cwt(data, scipy.signal.ricker, widths).
+
+    Returns (len(widths), len(data)).
+    """
+
+    output = np.empty(
+        (len(widths), len(data)),
+        dtype=np.float64
+    )
+
+    for index, width in enumerate(widths):
+
+        # SciPy truncated each wavelet to 10 * width samples, capped at
+        # the signal length.
+        points = int(min(10.0 * width, len(data)))
+        points = max(points, 1)
+
+        wavelet = ricker_wavelet(points, width)
+
+        # SciPy correlated via a reversed (conjugated) kernel; the ricker
+        # wavelet is real and symmetric, so the reversal is a no-op, but
+        # it is kept for exactness.
+        output[index] = np.convolve(
+            data,
+            wavelet[::-1],
+            mode='same'
+        )
+
+    return output
+
+
+WAVELET_WIDTHS = [
+    float(ricker_width_for_frequency(f, SAMPLING_RATE_HZ))
+    for f in WAVELET_TARGET_FREQS_HZ
+]
+
+WAVELET_CENTRE_FREQS_HZ = [
+    float(ricker_centre_frequency(a, SAMPLING_RATE_HZ))
+    for a in WAVELET_WIDTHS
+]
+
+N_WAVELET_SCALES = len(WAVELET_WIDTHS)
+
+print(f"\nWavelet scalogram: {N_WAVELET_SCALES} Ricker scales "
+      f"at fs = {SAMPLING_RATE_HZ:.0f} Hz")
+print(f"  {'target Hz':>10} {'width a':>10} {'centre Hz':>10} "
+      f"{'support':>8}")
+
+for _f, _a, _c in zip(WAVELET_TARGET_FREQS_HZ, WAVELET_WIDTHS,
+                      WAVELET_CENTRE_FREQS_HZ):
+    print(f"  {_f:>10.1f} {_a:>10.4f} {_c:>10.4f} "
+          f"{int(min(10.0 * _a, SEGMENT_LENGTH)):>8}")
+
+
+# =========================================================
 # 7. EXTRACT ECG + RR FEATURES
 # =========================================================
 
@@ -473,6 +595,12 @@ def extract_beats_from_record(
 
         segment = normalize_segment(segment)
 
+        # (SEGMENT_LENGTH,) -> (SEGMENT_LENGTH, N_WAVELET_SCALES)
+        segment = cwt_ricker(
+            segment,
+            WAVELET_WIDTHS
+        ).T.astype(np.float32)
+
         beats.append(segment)
 
         labels.append(
@@ -563,7 +691,9 @@ def augment_segment(segment):
 
         if shift != 0:
 
-            x = np.roll(x, shift)
+            # axis=0 is time; without it np.roll would flatten the
+            # (time, scale) array and mix channels.
+            x = np.roll(x, shift, axis=0)
 
             if shift > 0:
                 x[:shift] = x[shift]
@@ -610,7 +740,9 @@ def augment_training_data(
 
     for sample, rr, label in zip(X, RR, y):
 
-        segment = sample.squeeze(-1)
+        # sample is (SEGMENT_LENGTH, N_WAVELET_SCALES); the channel
+        # axis is real now, so there is nothing to squeeze.
+        segment = sample
 
         # N
         if label == 0:
@@ -630,11 +762,6 @@ def augment_training_data(
         for _ in range(multiplier):
 
             aug = augment_segment(segment)
-
-            aug = np.expand_dims(
-                aug,
-                axis=-1
-            )
 
             X_list.append(
                 aug[np.newaxis, ...]
@@ -994,20 +1121,19 @@ RR_test = apply_rr_norm(RR_test, RR_NORM_MEAN, RR_NORM_STD)
 # 16. PREPARE CNN INPUT
 # =========================================================
 
-X_train = np.expand_dims(
-    X_train,
-    axis=-1
-)
+# No expand_dims any more. Beats leave section 7 already shaped
+# (SEGMENT_LENGTH, N_WAVELET_SCALES), so the Conv1D channel axis is the
+# wavelet scale axis. build_model() takes its input shape from the data,
+# so the branch widens from 1 to 9 channels without a code change.
 
-X_valid = np.expand_dims(
-    X_valid,
-    axis=-1
-)
+for _name, _arr in (("train", X_train), ("valid", X_valid),
+                    ("test", X_test)):
+    assert _arr.ndim == 3, f"{_name}: expected 3 dims, got {_arr.shape}"
+    assert _arr.shape[1] == SEGMENT_LENGTH, f"{_name}: {_arr.shape}"
+    assert _arr.shape[2] == N_WAVELET_SCALES, f"{_name}: {_arr.shape}"
 
-X_test = np.expand_dims(
-    X_test,
-    axis=-1
-)
+print(f"\nCNN input shapes  train {X_train.shape}  "
+      f"valid {X_valid.shape}  test {X_test.shape}")
 
 
 # =========================================================
@@ -1894,6 +2020,14 @@ metrics = {
         "ds1_val": DS1_VAL,
 
         "val_selection_rule": VAL_SELECTION_RULE,
+
+        "wavelet_scales": WAVELET_WIDTHS,
+
+        "wavelet_centre_frequencies": WAVELET_CENTRE_FREQS_HZ,
+
+        "wavelet_target_frequencies": WAVELET_TARGET_FREQS_HZ,
+
+        "sampling_rate_hz": SAMPLING_RATE_HZ,
 
         "rr_feature_names": RR_FEATURE_NAMES,
 
