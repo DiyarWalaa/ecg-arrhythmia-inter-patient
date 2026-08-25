@@ -166,6 +166,17 @@ RUNS = [
           lambda v: isinstance(v, list) and len(v) == 9
           and abs(v[0] - 10.0) < 1e-6},
      None),          # assembled from the artefacts - see e5_note()
+
+    ("E6", "E6_balanced_sampling", "5b3b203",
+     "balanced batch sampling (1:1:1) + plain cross-entropy",
+     {"run_name": "E6_balanced_sampling",
+      "config.ds1_val": ["207", "220", "223"],
+      "config.sampler": "balanced_batch",
+      "config.loss": "categorical_crossentropy",
+      "config.focal_loss_used": False,
+      "config.oversampling": False,
+      "config.total_parameters": 239171},
+     None),          # assembled from the artefacts - see e6_note()
 ]
 
 
@@ -439,8 +450,41 @@ def e5_note(m, h, gaps):
              p0=e2a["S"]["precision"], p1=a["S"]["precision"])
 
 
+def e6_note(m, h, gaps):
+    """E6 is the best run so far and the first where tuning transferred."""
+    a = m["test_argmax"]["classification_report"]
+    t = m["test_tuned"]["classification_report"]
+    e2 = json.load(open(os.path.join(RESULTS, "E2_wavelet_input",
+                                     "metrics.json")))
+    e2a = e2["test_argmax"]["classification_report"]
+    return (
+        "**Best run so far: macro-F1 {m1:.4f} argmax, {mt:.4f} tuned**, "
+        "against E2's {m0:.4f}. S-F1 nearly doubled, {s0:.4f} -> {s1:.4f}, "
+        "driven by recall {r0:.4f} -> {r1:.4f} at a modest precision cost "
+        "{p0:.4f} -> {p1:.4f}. Class balance moved from duplicating data to "
+        "SAMPLING it, so hard constraint 2 holds for the first time since "
+        "E0.\n\n"
+        "  **`best_epoch` is {be}, not 1** - the first run since step 3 to "
+        "train past the first epoch and the first where **threshold tuning "
+        "transferred** ({mt:+.4f} on test after failing by -0.0495 at E1 and "
+        "-0.0846 at E2).\n\n"
+        "  **But the sampler is under-firing.** de Waele et al. reach S "
+        "recall 0.9116 at precision 0.3327 with this mechanism; we reached "
+        "{r1:.4f} at {p1:.4f} - HIGHER precision than theirs, well under half "
+        "the recall. N-F1 only fell {n0:.4f} -> {n1:.4f}, which says the "
+        "1:1:1 ratio is not pushing S hard enough. E7 sweeps the ratio."
+    ).format(m1=a["macro avg"]["f1-score"], mt=t["macro avg"]["f1-score"],
+             m0=e2a["macro avg"]["f1-score"],
+             s0=e2a["S"]["f1-score"], s1=a["S"]["f1-score"],
+             r0=e2a["S"]["recall"], r1=a["S"]["recall"],
+             p0=e2a["S"]["precision"], p1=a["S"]["precision"],
+             n0=e2a["N"]["f1-score"], n1=a["N"]["f1-score"],
+             be=m["best_epoch"])
+
+
 ASSEMBLED = {"4": step4_note, "5": step5_note, "E1": e1_note,
-             "E2": e2_note, "E3": e3_note, "E4": e4_note, "E5": e5_note}
+             "E2": e2_note, "E3": e3_note, "E4": e4_note, "E5": e5_note,
+             "E6": e6_note}
 
 
 # --------------------------------------------------------------------- build

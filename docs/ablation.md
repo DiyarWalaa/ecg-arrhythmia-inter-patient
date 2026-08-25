@@ -31,6 +31,7 @@ DS2. All metrics below are on DS2 (inter-patient test set).
 | E3 | log-spaced wavelet scales 3-90 Hz | `fe14c34` | 0.6151 | 0.1013 | 0.2875 | 0.1498 | 0.7321 | 0.9270 |
 | E4 | revert to E2 scales, capacity 239,171 -> 16,283 | `cb9224e` | 0.5602 | 0.0000 | 0.0000 | 0.0000 | 0.7133 | 0.9309 |
 | E5 | E2 architecture + direct RR skip to the output layer | `986dc29` | 0.7012 | 0.1574 | 0.4419 | 0.2321 | 0.8982 | 0.9498 |
+| E6 | balanced batch sampling (1:1:1) + plain cross-entropy | `5b3b203` | 0.7263 | 0.3388 | 0.3934 | 0.3641 | 0.8503 | 0.9352 |
 
 ## Notes
 
@@ -101,6 +102,13 @@ DS2. All metrics below are on DS2 (inter-patient test set).
 
   Read together with E4, two hypotheses are now eliminated: S is not limited by overfitting (E4) and not by RR attenuation (E5). What remains is that the model is never **asked** to predict S - N outnumbers S 60:1 in every minibatch. That is what E6 changes.
 
+- **step E6** (`E6_balanced_sampling`) - train distribution N=40301 / S=670 / V=3105. Ran 16 epochs; selection on `val_macro_f1` chose **epoch 6** (best val macro-F1 0.5540); early stopping fired: True.
+  **Best run so far: macro-F1 0.7263 argmax, 0.7372 tuned**, against E2's 0.7178. S-F1 nearly doubled, 0.2686 -> 0.3641, driven by recall 0.1972 -> 0.3388 at a modest precision cost 0.4214 -> 0.3934. Class balance moved from duplicating data to SAMPLING it, so hard constraint 2 holds for the first time since E0.
+
+  **`best_epoch` is 6, not 1** - the first run since step 3 to train past the first epoch and the first where **threshold tuning transferred** (+0.7372 on test after failing by -0.0495 at E1 and -0.0846 at E2).
+
+  **But the sampler is under-firing.** de Waele et al. reach S recall 0.9116 at precision 0.3327 with this mechanism; we reached 0.3388 at 0.3934 - HIGHER precision than theirs, well under half the recall. N-F1 only fell 0.9735 -> 0.9646, which says the 1:1:1 ratio is not pushing S hard enough. E7 sweeps the ratio.
+
 ## Test-minus-validation gap
 
 A model selected on a trustworthy validation signal should not score wildly
@@ -118,6 +126,7 @@ differently on test. The gap is `test macro-F1 - best_val_macro_f1`:
 | E3 | 0.6629 | 0.6151 | -0.0477 |
 | E4 | 0.5242 | 0.5602 | +0.0360 |
 | E5 | 0.5620 | 0.7012 | +0.1392 |
+| E6 | 0.5540 | 0.7263 | +0.1723 |
 
 Steps 2 and 3 scored **above** validation, which is the expected direction
 when validation holds only three patients and two of them are hard. Step 4 is

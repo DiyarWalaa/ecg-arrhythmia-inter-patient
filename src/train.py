@@ -85,6 +85,25 @@ tf.keras.utils.set_random_seed(SEED)
 tf.config.experimental.enable_op_determinism()
 
 
+def reset_seeds(seed=SEED):
+    """Re-seed every RNG so each sweep setting starts identically.
+
+    Without this the later ratios would train from different weight
+    initialisations and a difference in val macro-F1 could not be
+    attributed to the sampling ratio alone.
+    """
+
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+    random.seed(seed)
+
+    np.random.seed(seed)
+
+    tf.random.set_seed(seed)
+
+    tf.keras.utils.set_random_seed(seed)
+
+
 
 # =========================================================
 # 2. GPU CHECK
@@ -1257,49 +1276,84 @@ y_test_cat = tf.keras.utils.to_categorical(
 
 SAMPLER = "balanced_batch"
 
-SAMPLING_WEIGHTS = [1.0 / NUM_CLASSES] * NUM_CLASSES
+# E7: 1:1:1 was never validated, it was just the obvious starting point.
+# De Waele et al. reach S recall 0.9116 at S precision 0.3327; E6 reached
+# 0.3388 recall at 0.3934 precision - HIGHER precision than theirs, half
+# the recall. Precision is available to spend on recall, so sweep how hard
+# the sampler pushes S and let DS1_VAL choose.
+#
+# A ratio r means S is drawn r times as often as each of N and V:
+# weights proportional to [1, r, 1], normalised. r = 1 reproduces E6.
+SAMPLER_RATIO_GRID = [1.0, 2.0, 3.0, 4.0]
 
 STEPS_PER_EPOCH = int(np.ceil(len(y_tr_aug) / BATCH_SIZE))
 
-_per_class_datasets = []
+
+def weights_for_ratio(ratio, n_classes=NUM_CLASSES, minority_index=1):
+    """Sampling weights over [N, S, V] for an S:N drawing ratio.
+
+    Weights are proportional to [1, ratio, 1] and normalised to sum to 1,
+    so ratio 1.0 gives exactly [1/3, 1/3, 1/3].
+    """
+
+    raw = [1.0] * n_classes
+    raw[minority_index] = float(ratio)
+
+    total = sum(raw)
+
+    return [w / total for w in raw]
+
+
+def make_balanced_dataset(weights):
+    """One infinite, class-balanced, batched stream for the given weights.
+
+    Each class becomes its own shuffled, repeated dataset; the classes are
+    interleaved by sample_from_datasets according to `weights`. S beats
+    repeat from the real 670 - nothing synthetic is created.
+    """
+
+    per_class = []
+
+    for class_index in range(NUM_CLASSES):
+
+        mask = (y_tr_aug == class_index)
+        n_class = int(mask.sum())
+
+        class_ds = tf.data.Dataset.from_tensor_slices((
+            (X_tr_aug[mask], RR_tr_aug[mask]),
+            y_tr_aug_cat[mask]
+        ))
+
+        class_ds = class_ds.shuffle(
+            n_class,
+            seed=SEED,
+            reshuffle_each_iteration=True
+        ).repeat()
+
+        per_class.append(class_ds)
+
+    stream = tf.data.Dataset.sample_from_datasets(
+        per_class,
+        weights=weights,
+        seed=SEED
+    )
+
+    return stream.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
 
 for _class_index in range(NUM_CLASSES):
-
-    _mask = (y_tr_aug == _class_index)
-    _n_class = int(_mask.sum())
-
     print(f"  sampler class {INT_TO_LABEL[_class_index]}: "
-          f"{_n_class} real beats")
+          f"{int((y_tr_aug == _class_index).sum())} real beats")
 
-    _class_ds = tf.data.Dataset.from_tensor_slices((
-        (X_tr_aug[_mask], RR_tr_aug[_mask]),
-        y_tr_aug_cat[_mask]
-    ))
-
-    # Shuffle the whole class pool, then repeat forever. With replacement
-    # across epochs: the 670 S beats recycle far more often than the
-    # 40,301 N beats, which is the point.
-    _class_ds = _class_ds.shuffle(
-        _n_class,
-        seed=SEED,
-        reshuffle_each_iteration=True
-    ).repeat()
-
-    _per_class_datasets.append(_class_ds)
-
-train_dataset = tf.data.Dataset.sample_from_datasets(
-    _per_class_datasets,
-    weights=SAMPLING_WEIGHTS,
-    seed=SEED
-)
-
-train_dataset = train_dataset.batch(
-    BATCH_SIZE
-).prefetch(tf.data.AUTOTUNE)
-
-print(f"\nBalanced sampler: weights {SAMPLING_WEIGHTS}, "
-      f"batch {BATCH_SIZE}, {STEPS_PER_EPOCH} steps/epoch "
+print(f"\nSampler ratio grid {SAMPLER_RATIO_GRID}, batch {BATCH_SIZE}, "
+      f"{STEPS_PER_EPOCH} steps/epoch "
       f"({len(y_tr_aug)} training beats / {BATCH_SIZE})")
+print(f"  {'ratio':>6}  {'weights [N, S, V]':<34} {'sum':>8}")
+
+for _ratio in SAMPLER_RATIO_GRID:
+    _w = weights_for_ratio(_ratio)
+    print(f"  {_ratio:>6.1f}  {[round(v, 6) for v in _w]!s:<34} "
+          f"{sum(_w):>8.4f}")
 
 
 # =========================================================
@@ -1455,12 +1509,11 @@ def build_model(ecg_shape, rr_shape):
     return model
 
 
-model = build_model(
-    ecg_shape=X_tr_aug.shape[1:],
-    rr_shape=(len(RR_FEATURE_NAMES),)
-)
+# The model is NOT built here any more. Section 22 builds one per ratio
+# in the sweep and keeps the one validation selects.
 
-model.summary()
+ECG_INPUT_SHAPE = X_tr_aug.shape[1:]
+RR_INPUT_SHAPE = (len(RR_FEATURE_NAMES),)
 
 
 # =========================================================
@@ -1552,61 +1605,168 @@ class ValidationMetrics(tf.keras.callbacks.Callback):
 
 CLASS_NAMES = [INT_TO_LABEL[i] for i in range(NUM_CLASSES)]
 
-val_metrics_cb = ValidationMetrics(
-    [X_val, RR_val],
-    y_val,
-    CLASS_NAMES
-)
+def make_callbacks():
+    """Fresh callback objects for one sweep run.
 
-early_stopping = EarlyStopping(
-    monitor='val_macro_f1',
-    mode='max',
-    patience=10,
-    restore_best_weights=True
-)
+    EarlyStopping and ReduceLROnPlateau carry mutable state (wait, best,
+    stopped_epoch, best_weights) and ValidationMetrics accumulates its
+    records list, so they cannot be shared across ratios.
 
-reduce_lr = ReduceLROnPlateau(
-    monitor='val_macro_f1',
-    mode='max',
-    factor=0.5,
-    patience=5,
-    min_lr=1e-6
-)
+    Returns (callbacks, val_metrics_cb, early_stopping). val_metrics_cb
+    MUST be first: it writes 'val_macro_f1' into the shared logs dict and
+    the two below read that key in the same on_epoch_end pass.
+    """
 
-# val_metrics_cb MUST be first: it writes 'val_macro_f1' into the shared
-# logs dict, and the two callbacks below read that key in the same
-# on_epoch_end pass.
-callbacks = [
-
-    val_metrics_cb,
-
-    early_stopping,
-
-    reduce_lr
-]
-
-
-# =========================================================
-# 22. TRAIN MODEL
-# =========================================================
-
-history = model.fit(
-
-    train_dataset,
-
-    validation_data=(
+    val_cb = ValidationMetrics(
         [X_val, RR_val],
-        y_val_cat
-    ),
+        y_val,
+        CLASS_NAMES
+    )
 
-    epochs=EPOCHS,
+    early = EarlyStopping(
+        monitor='val_macro_f1',
+        mode='max',
+        patience=10,
+        restore_best_weights=True
+    )
 
-    steps_per_epoch=STEPS_PER_EPOCH,
+    plateau = ReduceLROnPlateau(
+        monitor='val_macro_f1',
+        mode='max',
+        factor=0.5,
+        patience=5,
+        min_lr=1e-6
+    )
 
-    callbacks=callbacks,
+    return [val_cb, early, plateau], val_cb, early
 
-    verbose=1
+
+# =========================================================
+# 22. TRAIN MODEL - SAMPLER RATIO SWEEP, SELECTED ON VALIDATION
+# =========================================================
+
+# One model per ratio, each from an identical seed reset. Selection is on
+# best val macro-F1 over DS1_VAL.
+#
+# THE TEST SET IS NOT TOUCHED IN THIS LOOP. No X_test / RR_test /
+# y_test_encoded appears below; DS2 is evaluated exactly once, in section
+# 24, on whichever model this loop selects.
+
+SAMPLER_SWEEP = []
+
+model = None
+history = None
+val_metrics_cb = None
+early_stopping = None
+
+SELECTED_RATIO = None
+SAMPLING_WEIGHTS = None
+BEST_SWEEP_VAL = None
+
+for sweep_ratio in SAMPLER_RATIO_GRID:
+
+    sweep_weights = weights_for_ratio(sweep_ratio)
+
+    print("\n" + "=" * 60)
+    print(f"SWEEP: sampler ratio {sweep_ratio} -> weights "
+          f"{[round(v, 6) for v in sweep_weights]}")
+    print("=" * 60)
+
+    # Identical initialisation for every ratio, so any difference in val
+    # macro-F1 is attributable to the ratio and not to weight init.
+    reset_seeds()
+
+    sweep_dataset = make_balanced_dataset(sweep_weights)
+
+    sweep_callbacks, sweep_val_cb, sweep_early = make_callbacks()
+
+    sweep_model = build_model(
+        ecg_shape=ECG_INPUT_SHAPE,
+        rr_shape=RR_INPUT_SHAPE
+    )
+
+    if sweep_ratio == SAMPLER_RATIO_GRID[0]:
+        sweep_model.summary()
+
+    sweep_history = sweep_model.fit(
+
+        sweep_dataset,
+
+        validation_data=(
+            [X_val, RR_val],
+            y_val_cat
+        ),
+
+        epochs=EPOCHS,
+
+        steps_per_epoch=STEPS_PER_EPOCH,
+
+        callbacks=sweep_callbacks,
+
+        verbose=1
+    )
+
+    sweep_curve = [
+        float(rec["val_macro_f1"])
+        for rec in sweep_val_cb.records
+    ]
+
+    if sweep_curve:
+        sweep_best = float(max(sweep_curve))
+        sweep_best_epoch = int(sweep_curve.index(sweep_best)) + 1
+    else:
+        sweep_best = float("-inf")
+        sweep_best_epoch = None
+
+    SAMPLER_SWEEP.append({
+        "ratio": float(sweep_ratio),
+        "weights": [float(v) for v in sweep_weights],
+        "best_val_macro_f1": sweep_best,
+        "best_epoch": sweep_best_epoch,
+        "epochs_run": len(sweep_curve),
+        "early_stopping_fired": int(sweep_early.stopped_epoch) > 0,
+        "val_macro_f1_curve": sweep_curve
+    })
+
+    print(f"\n  ratio {sweep_ratio}: best val macro-F1 {sweep_best:.4f} "
+          f"at epoch {sweep_best_epoch} of {len(sweep_curve)}")
+
+    if BEST_SWEEP_VAL is None or sweep_best > BEST_SWEEP_VAL:
+
+        BEST_SWEEP_VAL = sweep_best
+        SELECTED_RATIO = float(sweep_ratio)
+        SAMPLING_WEIGHTS = [float(v) for v in sweep_weights]
+
+        # Keep this run's objects; sections 22B onward use these names.
+        model = sweep_model
+        history = sweep_history
+        val_metrics_cb = sweep_val_cb
+        early_stopping = sweep_early
+
+
+# --- selection, still without touching DS2 ------------------------------
+
+SAMPLER_SELECTION_CRITERION = (
+    "highest best val macro-F1 on DS1_VAL across SAMPLER_RATIO_GRID; the "
+    "test set was not evaluated during the sweep and is scored exactly "
+    "once, in section 24, on the selected model"
 )
+
+print("\n" + "=" * 60)
+print("SAMPLER RATIO SWEEP RESULT")
+print("=" * 60)
+print(f"  {'ratio':>6} {'best val macro-F1':>19} {'best epoch':>11} "
+      f"{'epochs':>7}  weights")
+
+for entry in SAMPLER_SWEEP:
+    marker = "  <-- selected" if entry["ratio"] == SELECTED_RATIO else ""
+    print(f"  {entry['ratio']:>6.1f} {entry['best_val_macro_f1']:>19.4f} "
+          f"{str(entry['best_epoch']):>11} {entry['epochs_run']:>7}  "
+          f"{[round(v, 4) for v in entry['weights']]}{marker}")
+
+print(f"\n  selected ratio  : {SELECTED_RATIO}")
+print(f"  selected weights: {[round(v, 6) for v in SAMPLING_WEIGHTS]}")
+print(f"  criterion: {SAMPLER_SELECTION_CRITERION}")
 
 
 # =========================================================
@@ -2124,6 +2284,12 @@ metrics = {
 
         "sampler": SAMPLER,
 
+        "sampler_ratio_grid": SAMPLER_RATIO_GRID,
+
+        "selected_ratio": SELECTED_RATIO,
+
+        "sampler_selection_criterion": SAMPLER_SELECTION_CRITERION,
+
         "sampling_weights": SAMPLING_WEIGHTS,
 
         "steps_per_epoch": STEPS_PER_EPOCH,
@@ -2188,6 +2354,8 @@ metrics = {
     "confusion_matrix": cm.tolist(),
 
     "per_class_roc_auc": per_class_roc_auc,
+
+    "sampler_sweep": SAMPLER_SWEEP,
 
     "threshold_weights": [float(w) for w in THRESHOLD_WEIGHTS],
 
