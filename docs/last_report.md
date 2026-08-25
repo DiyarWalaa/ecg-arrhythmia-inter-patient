@@ -1,94 +1,66 @@
 # Last report
 
-**Task:** E6 - revert the E5 skip; balanced batch sampling with plain
-cross-entropy.
+**Task:** E7 - sweep the balanced-sampler class ratio, selected on validation.
 
 **Date:** 2026-08-25
 
 ---
 
-## E5 predictions - scorecard
+## E6 predictions - scorecard
 
 | # | prediction | outcome |
 |---|---|---|
-| 1 | total parameters 239,186 | **still not verifiable** - E5's `metrics.json` has no parameter count. Fixed this step. |
-| 2 | 425 steps/epoch, frequencies `[10, ..., 90]` | **PASS** |
-| 3 | **S-F1 will exceed E2's 0.2686** | **FAIL** - 0.2321 |
-| 4 | N-F1 and V-F1 move very little | **PASS** - N 0.9787 -> 0.9734, V 0.9111 -> 0.8982 |
+| 1 | 345 steps, sampler config keys, **`total_parameters == 239171`** | **PASS - all exact.** First run where a parameter claim was checkable from the artefact, and it holds. |
+| 2 | S recall rises well past 0.1972, above 0.60 | **FAIL** - 0.3388 |
+| 3 | S precision falls below 0.20 | **FAIL** - 0.3934 |
+| 4 | N-F1 drops from 0.9787; above 0.95 means under-firing | **PASS** - 0.9646 |
 
-**Prediction 3 was the experiment and it failed.** Fifteen parameters giving
-the output layer an un-mediated view of the five RR ratios changed nothing
-useful. S recall went 0.1972 -> 0.1574 and S precision 0.4214 -> 0.4419: the
-model became slightly *more conservative*, not more sensitive. `best_epoch`
-was 1 again.
+**Predictions 2 and 3 failed in the same direction**, and prediction 4 says
+why: the sampler moved everything less than I expected. I wrote that N-F1
+holding above 0.95 would mean the sampler was under-firing. It held at 0.9646.
+It is under-firing - which is precisely the premise of E7.
 
-So the RR signal is **not** attenuated by network depth. I flagged in E5's
-report that a 5-wide skip against a 64-wide vector was a weak intervention and
-that a null result should not be over-read - that caveat stands, but the
-direction of the change (recall down, precision up) argues against attenuation
-rather than merely failing to confirm it.
-
-**Two hypotheses are now eliminated.** E4: S is not limited by overfitting -
-cutting capacity 14.7x moved `best_epoch` off 1 and destroyed S completely
-(11 predictions in 1,836). E5: S is not limited by RR attenuation. What
-remains is that the model is never *asked* to predict S: N outnumbers S 60:1
-in every minibatch it has ever seen.
+**E6 is nonetheless the best run so far**: macro-F1 0.7263 argmax, **0.7372
+tuned**, S-F1 0.3641 (nearly double E2's 0.2686). Two firsts: `best_epoch` is
+**6** rather than 1, and **threshold tuning finally transferred** (+0.0109 on
+test, after -0.0495 at E1 and -0.0846 at E2). Hard constraint 2 also holds
+again for the first time since E0.
 
 ---
 
 ## What changed
 
-**Part 1 - the E5 skip is gone.** `build_model`'s layer graph is byte-identical
-to E2's again.
+**`SAMPLER_RATIO_GRID = [1.0, 2.0, 3.0, 4.0]`**, with weights derived rather
+than hardcoded:
 
-**Part 2 - balanced batch sampling:**
-
-- Section 18 no longer calls `augment_training_data()`. `X_tr_aug` etc. pass
-  straight through; the function has **zero call sites** and sections 9 and 10
-  are marked `[DEPRECATED]`.
-- New section **19B** builds three per-class `tf.data.Dataset`s, each
-  `.shuffle(n_class, seed=SEED).repeat()`, combined by
-  `tf.data.Dataset.sample_from_datasets(weights=[1/3, 1/3, 1/3], seed=SEED)`,
-  then `.batch(BATCH_SIZE).prefetch(AUTOTUNE)`.
-- `STEPS_PER_EPOCH = ceil(44076 / 128) = 345`, passed explicitly to
-  `model.fit`, which now receives `train_dataset` positionally and **no**
-  `batch_size` (illegal alongside a Dataset).
-- Loss is plain `'categorical_crossentropy'`. `categorical_focal_loss` has
-  zero call sites and its section is marked `[DEPRECATED]`.
-- `metrics.json` config gains `sampler`, `sampling_weights`,
-  `steps_per_epoch`, `loss`, `focal_loss_used` and **`total_parameters`**.
-
-**No synthetic data is created.** S beats repeat from the 670 real ones inside
-an infinite stream, so hard constraint 2 holds - the first time it has since
-E0.
-
----
-
-## One instruction I could not satisfy literally
-
-You asked that `build_model` "must return to being byte-identical to E2's",
-and separately that the focal loss be replaced with cross-entropy.
-**`model.compile()` lives inside `build_model`**, so both cannot hold.
-
-The layer graph *is* byte-identical - I verified it by slicing everything
-before `model.compile(` from both versions and comparing:
-
-```
-layer graph (everything before model.compile) byte-identical to E2: True
+```python
+def weights_for_ratio(ratio, n_classes=NUM_CLASSES, minority_index=1):
+    raw = [1.0] * n_classes
+    raw[minority_index] = float(ratio)
+    total = sum(raw)
+    return [w / total for w in raw]
 ```
 
-The entire remaining diff inside `build_model` is the loss argument:
+A ratio `r` draws S `r` times as often as each of N and V - weights
+proportional to `[1, r, 1]`, normalised.
 
-```diff
--        loss=categorical_focal_loss(
--            alpha=FOCAL_ALPHA,
--            gamma=FOCAL_GAMMA
--        ),
-+        loss='categorical_crossentropy',
-```
+**Three new helpers**: `reset_seeds()` (identical initialisation per setting),
+`make_balanced_dataset(weights)` (the per-class stream factory, lifted out of
+the old inline section 19B), and `make_callbacks()` (EarlyStopping,
+ReduceLROnPlateau and ValidationMetrics all carry mutable state, so they
+cannot be shared across runs).
 
-Parameter count is unaffected by the loss: **239,171**, confirmed by the
-same analytic method that reproduces E2's and E4's known totals.
+**Section 22 is the sweep.** Per ratio: reset seeds, build the dataset, build
+the model, train with `steps_per_epoch = 345`, record the best val macro-F1,
+best epoch, epochs run, early-stopping flag and the full per-epoch curve. The
+winner is kept under the names `model` / `history` / `val_metrics_cb` /
+`early_stopping`, so sections 22B through 30 - the diagnostics, the threshold
+tuning and the test evaluation - needed **no changes at all**.
+
+**metrics.json** gains `sampler_ratio_grid`, `selected_ratio`,
+`sampler_selection_criterion` and `sampler_sweep` (per ratio: weights, best
+val macro-F1, best epoch, epochs run, full curve). `sampling_weights` now
+records the *selected* vector. `total_parameters` was added at E6.
 
 ---
 
@@ -96,171 +68,152 @@ same analytic method that reproduces E2's and E4's known totals.
 
 **py_compile** - passed, exit code 0.
 
-**`ast.dump` against E5 HEAD:** `changed: ['build_model']`, nothing added or
-removed. Sections 18, 19B and the fit call are module-level, so they do not
-appear in a function diff.
-
-**`augment_training_data` call graph** (AST, not grep): **called from
-NOWHERE**. `categorical_focal_loss`: **zero call sites**. `compile` uses
-`'categorical_crossentropy'`.
-
-**Sampler structure, read from the AST:** one `sample_from_datasets` call with
-`weights=SAMPLING_WEIGHTS, seed=SEED`; `SAMPLING_WEIGHTS` evaluates to
-`[0.333333, 0.333333, 0.333333]` summing to 1.0; three `.shuffle`, three
-`.repeat`, one `.batch(BATCH_SIZE)`; `model.fit(train_dataset, ...,
-steps_per_epoch=..., ...)` with **no** `batch_size` kwarg.
-
-**Empirical sampler check - and its limitation.** TensorFlow is not installed
-locally, so `tf.data` cannot be executed here. I simulated the documented
-semantics of `sample_from_datasets` in numpy - a categorical draw over three
-infinite shuffled streams with weights 1/3 - and drew 20 batches of 128:
+**`ast.dump` against E6 HEAD:**
 
 ```
-   20 batches of 128, per-class counts (target 42.7 each):
-    batch      N      S      V   max deviation
-        1     43     43     42        0.7
-        2     45     40     43        2.7
-        3     45     42     41        2.3
-        4     44     42     42        1.3
-        5     37     43     48        5.7
-        6     52     38     38        9.3
-        7     41     41     46        3.3
-        8     45     42     41        2.3
-        9     37     43     48        5.7
-       10     52     40     36        9.3
-       11     39     49     40        6.3
-       12     39     47     42        4.3
-       13     46     37     45        5.7
-       14     39     35     54       11.3
-       15     43     47     38        4.7
-       16     41     47     40        4.3
-       17     48     42     38        5.3
-       18     43     41     44        1.7
-       19     49     38     41        6.3
-       20     37     55     36       12.3
-
-   mean per class over 20 batches: N 43.25  S 42.60  V 42.15
-   overall share: N 0.3379  S 0.3328  V 0.3293
-   multinomial std per class: 5.33  (observed 4.45)
-   worst single-batch deviation from 42.7: 12 (2.3 sd)
-
-C) what balanced sampling does to how often each beat is seen
+changed : NONE
+added   : ['make_balanced_dataset', 'make_callbacks', 'reset_seeds',
+           'weights_for_ratio']
+removed : NONE
 ```
 
-Mean per class 43.25 / 42.60 / 42.15 against a target of 42.67; overall shares
-0.3379 / 0.3328 / 0.3293; no class ever absent from a batch. The spread is
-ordinary multinomial noise (theoretical sd 5.33, worst single-batch deviation
-2.3 sd).
+**Zero existing functions changed**, and **`build_model` is byte-identical to
+E6's** - so the architecture, the loss and the 239,171 parameters are provably
+untouched.
 
-**This validates the sampling scheme, not `tf.data`'s implementation of it.**
-The Kaggle run is the first execution of the real pipeline, and the printed
-per-class counts should be compared against the table above.
+**The test set is not evaluated inside the sweep.** There are two loops over
+`SAMPLER_RATIO_GRID`; the sweep is the one with target `sweep_ratio`:
 
-**Constants and literals unchanged**: `PRE_SAMPLES = 90`, `POST_SAMPLES = 144`,
+```
+`for _ratio in SAMPLER_RATIO_GRID:`     lines 1353-1356  <- printing weights
+`for sweep_ratio in SAMPLER_RATIO_GRID:` lines 1666-1744 <- the sweep
+```
+
+Walking every AST node inside lines 1666-1744 for seventeen test-related
+names - `X_test`, `RR_test`, `y_test`, `y_test_encoded`, `y_test_cat`, `DS2`,
+`y_pred_prob`, `y_pred_enc`, `y_pred_enc_tuned`, `acc`, `acc_tuned`, `cm`,
+`cm_tuned`, `report_argmax`, `report_tuned`, `per_class_roc_auc`,
+`THRESHOLD_WEIGHTS`:
+
+```
+found: NONE          RESULT: CLEAN
+```
+
+Every `predict` / `evaluate` / `fit` call in the file, with position:
+
+```
+line 1691  INSIDE sweep    fit      obj=sweep_model
+line 1552  outside sweep   predict  self.x_val        (ValidationMetrics)
+line 1814  outside sweep   predict  X_val, RR_val     (per-record diagnostics)
+line 1881  outside sweep   predict  X_val, RR_val     (threshold tuning)
+line 1979  outside sweep   predict  X_test, RR_test   <- the only DS2 call
+```
+
+Code path in order: **sweep 1666-1744 -> selection line 1741
+(`model = sweep_model`) -> threshold tuning on validation line 1888 -> DS2
+scored once line 1980.**
+
+**Weight vectors** - every one matches the specification exactly:
+
+| ratio | weights [N, S, V] | sum | matches spec |
+|---|---|---|---|
+| 1.0 | `[0.333333, 0.333333, 0.333333]` | 1.000000 | yes |
+| 2.0 | `[0.25, 0.50, 0.25]` | 1.000000 | yes |
+| 3.0 | `[0.20, 0.60, 0.20]` | 1.000000 | yes |
+| 4.0 | `[0.166667, 0.666667, 0.166667]` | 1.000000 | yes |
+
+Ratio 1 equals E6's `[1/3, 1/3, 1/3]` to 1e-15. N and V weights are always
+equal; the S weight is strictly increasing across the grid.
+
+**Unchanged**: `PRE_SAMPLES = 90`, `POST_SAMPLES = 144`,
 `ADAM_LEARNING_RATE = 1e-4`, `RR_LOCAL_WINDOW = 10`, `RR_CLIP_MIN = 0.2`,
 `RR_CLIP_MAX = 3.0`, `SAMPLING_RATE_HZ = 360.0`, `BATCH_SIZE = 128` - one
-occurrence each. `rr = [...]` and `RR_FEATURE_NAMES` byte-identical.
-`WAVELET_TARGET_FREQS_HZ` identical to E2's, widths 8.1028 ... 0.9003.
-`DS1` `9f20e3ac1758a312...`, `DS2` `b8a3e6bbdeeec72a...`, `DS1_VAL`
+occurrence each. `loss='categorical_crossentropy'`;
+`categorical_focal_loss` and `augment_training_data` both have **zero call
+sites**. `rr = [...]` and `RR_FEATURE_NAMES` byte-identical;
+`WAVELET_TARGET_FREQS_HZ` identical, widths 8.1028 ... 0.9003. `DS1`
+`9f20e3ac1758a312...`, `DS2` `b8a3e6bbdeeec72a...`, `DS1_VAL`
 `0d9df3612a6111a1...` = `['207','220','223']`.
 
 ---
 
-## What balanced sampling actually does to exposure
+## What the grid actually costs
 
-This is the part worth pausing on before reading the result.
+Worth seeing before reading the result. With 345 steps of 128:
 
-```
-C) what balanced sampling does to how often each beat is seen
-   samples per epoch: 345 steps x 128 = 44160
-   cls    beats  draws/epoch     times seen
-   N      40301        14720           0.37
-   S        670        14720          21.97
-   V       3105        14720           4.74
+| ratio | S draws/epoch | each S beat seen | N pool seen/epoch |
+|---|---|---|---|
+| 1.0 | 14,720 | 22.0x | 37% |
+| 2.0 | 22,080 | 33.0x | 27% |
+| 3.0 | 26,496 | 39.5x | 22% |
+| 4.0 | 29,440 | 43.9x | 18% |
 
-   For comparison, the augmentation E6 removes gave each S beat
-   7 copies per epoch. The sampler shows each S beat ~22 times.
-   And only 37% of the N pool is seen in a given epoch.
-
-D) results
-```
-
-**Each S beat is now seen about 22 times per epoch** - three times more
-repetition than the sevenfold augmentation E6 just removed. And **only 37% of
-the N pool is seen in any given epoch**: the model now sees roughly 14,720 N
-beats per epoch instead of 40,301.
-
-Both follow directly from equal weights plus a fixed 345-step epoch, and both
-are intended. But "no synthetic data" is not the same as "no repetition", and
-the constraint-2 argument for this change should not be read as an argument
-that repetition has gone away - it has increased for S.
+At ratio 4 the model sees each of the 670 S beats **44 times per epoch** and
+only **18% of the 40,301 N beats**. Pushing S harder is not free: it buys S
+exposure by starving N coverage, and at some point the N class will degrade
+faster than S improves. That crossover is what the sweep is measuring.
 
 ---
 
 ## Falsifiable predictions
 
-1. **345 steps/epoch**, `config.sampler == "balanced_batch"`,
-   `sampling_weights == [1/3, 1/3, 1/3]`, `loss == "categorical_crossentropy"`,
-   `focal_loss_used == false`, `oversampling == false`, and
-   **`total_parameters == 239171`** - the first run where that last claim is
-   checkable from the artefact.
-2. **S recall will rise sharply, well past E2's 0.1972** - I expect above 0.60.
-   This is the mechanism De Waele et al. attribute their 0.9116 to, and it is
-   the first time our model will see S in a third of its training signal.
-3. **S precision will fall well below E2's 0.4214** - probably under 0.20.
-   Their S precision is 0.3327 *with* RR fusion; a balanced sampler trades
-   precision for recall, and our N pool is 60x larger than theirs relative to S.
-   **Whether S-F1 beats 0.2686 depends entirely on which moves further**, and I
-   am not confident in the direction.
-4. **N-F1 will drop from 0.9787**, because N is now a third of the training
-   signal rather than 91% of it. If N-F1 holds above 0.95 the sampler is
-   under-firing; if it falls below 0.90 it is over-firing.
+1. **`sampler_sweep` will have 4 entries** with the weight vectors tabulated
+   above, `total_parameters == 239171`, `steps_per_epoch == 345`,
+   `loss == "categorical_crossentropy"`, and `selected_ratio` equal to
+   whichever entry has the highest `best_val_macro_f1`.
+2. **Ratio 1.0 will not be selected.** E6 showed the 1:1:1 point under-firing
+   with N-F1 still at 0.9646; there should be headroom above it. I expect
+   **2.0 or 3.0**.
+3. **S recall will rise monotonically with the ratio, and S precision will
+   fall monotonically.** This is the mechanism, and if the sweep does not show
+   both trends across the four settings then the ratio is not doing what I
+   think it is.
+4. **Ratio 4.0 will have the worst N-F1 of the four**, and I expect it below
+   0.93 - at 18% N coverage per epoch the N class starts to suffer.
 
-Prediction 2 is the mechanism test. Prediction 3 is the cost. Prediction 1 is
-the integrity check.
+Prediction 2 is the bet. Prediction 3 is the mechanism check. I am **not**
+predicting the selected model beats E6's 0.7372 tuned: a better operating
+point on validation need not transfer, and validation is only 273 S beats.
 
 ---
 
 ## Commit
 
 ```
-5b3b203  E6: balanced batch sampling with plain cross-entropy
+1339261  E7: validation-selected sampler ratio sweep
 ```
 
-Pushed to `origin/main`. `docs/ablation.md` now carries 13 runs including E5.
+Pushed to `origin/main`. `docs/ablation.md` now carries 14 runs including E6.
 
 ---
 
 ## Problems
 
-1. **The sampler is untested against `tf.data` itself.** No TensorFlow
-   locally means the first real execution is on Kaggle. The AST check
-   guarantees the call shape; the numpy simulation guarantees the scheme is
-   sound; neither guarantees `sample_from_datasets` behaves as documented in
-   TF 2.20. If the printed per-class counts are not near 42.7, that is where
-   to look first.
+1. **Four trainings per run.** With `EPOCHS = 40` and E6 stopping around
+   epoch 16, expect roughly 4x E6's runtime. If Kaggle times out, drop ratio
+   1.0 from the grid - E6 already measured that point.
 
-2. **S repetition went up, not down** - ~22 times per epoch against
-   augmentation's 7. Constraint 2 is satisfied because nothing synthetic is
-   created, but if E6 overfits S, the repetition rate is the reason, and the
-   fix would be fewer steps per epoch rather than a different sampler.
+2. **Selecting the ratio on DS1_VAL adds a third selection layer.** We now
+   choose a checkpoint, a sampling ratio, and threshold weights against the
+   same 6,494 validation beats, 273 of them S. DS2 stays untouched so the test
+   number is honest, but the validation figure is now triply optimistic and
+   should not be quoted as a performance estimate.
 
-3. **Only 37% of N is seen per epoch.** With `EPOCHS = 40` and early stopping
-   typically firing well before that, some N beats may never be sampled in a
-   short run. That is a real change to what the model is trained on, not just
-   how often.
+3. **The sampler still cannot be executed locally.** No TensorFlow here, so
+   `make_balanced_dataset` is verified structurally and by the numpy
+   simulation from E6, not by running `tf.data`. E6's run confirmed the
+   mechanism works end to end, which raises confidence, but each new weight
+   vector is still unexecuted until Kaggle.
 
-4. **Three things changed at once**: the E5 skip removed, augmentation
-   removed, loss changed, sampler added. Against E2 that is three variables
-   (sampler, loss, no augmentation - the skip is absent from both). If E6
-   moves S sharply, attributing the gain between the sampler and the loss will
-   require a follow-up run.
+4. **Higher ratios amplify the repetition concern from E6.** 44 repeats per
+   epoch at ratio 4 is a lot of exposure to 670 beats. If the sweep selects a
+   high ratio and S-F1 improves on validation but not on DS2, memorisation of
+   the training S beats is the first thing to suspect.
 
-5. **`X_raw_train` is now unused.** `load_dataset` still computes and returns
-   the z-scored raw waveforms for every split, but nothing consumes them since
-   augmentation stopped. Harmless (~46 MB for DS2) and left in place because
-   removing it would touch `load_dataset`, which was out of scope.
+5. **`X_raw_train` is still unused** (carried from E6), and `SAMPLER` is still
+   the literal `"balanced_batch"` even though the ratio now varies - the ratio
+   is recorded separately in `selected_ratio`, so nothing is ambiguous, but
+   the name no longer implies 1:1:1.
 
-6. Carried over: threshold tuning has failed to transfer twice; record 114
-   lead swap unfixed; record 207 still a validation outlier;
-   `tools/inspect_ds1.py` JSON stale; stale root `__pycache__/`.
+6. Carried over: record 114 lead swap unfixed; record 207 still a validation
+   outlier; `tools/inspect_ds1.py` JSON stale; stale root `__pycache__/`.
