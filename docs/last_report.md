@@ -1,131 +1,94 @@
 # Last report
 
-**Task:** E5 - add a direct skip connection from the raw RR features to the
-output layer.
+**Task:** E6 - revert the E5 skip; balanced batch sampling with plain
+cross-entropy.
 
 **Date:** 2026-08-25
 
 ---
 
-## E4 predictions - scorecard
+## E5 predictions - scorecard
 
 | # | prediction | outcome |
 |---|---|---|
-| 1 | total parameters exactly 16,283 | **not verifiable from the artefacts** - `metrics.json` records no parameter count |
-| 2 | 425 steps/epoch, centre frequencies `[10, ..., 90]` | **PASS** - frequencies exact |
-| 3 | **`best_epoch` will be greater than 1** | **PASS** - 4 |
-| 4 | final train accuracy below E3's 0.9717 | **PASS** - 0.9003 |
+| 1 | total parameters 239,186 | **still not verifiable** - E5's `metrics.json` has no parameter count. Fixed this step. |
+| 2 | 425 steps/epoch, frequencies `[10, ..., 90]` | **PASS** |
+| 3 | **S-F1 will exceed E2's 0.2686** | **FAIL** - 0.2321 |
+| 4 | N-F1 and V-F1 move very little | **PASS** - N 0.9787 -> 0.9734, V 0.9111 -> 0.8982 |
 
-**Predictions 3 and 4 both landed, and the model still got worse.** That
-combination is the useful result. Reducing capacity 14.7x did fix the
-epoch-1 peak - selection moved to epoch 4 and the network stopped memorising
-(train accuracy 0.9717 -> 0.9003). So the early peak *was* a capacity
-artefact.
+**Prediction 3 was the experiment and it failed.** Fifteen parameters giving
+the output layer an un-mediated view of the five RR ratios changed nothing
+useful. S recall went 0.1972 -> 0.1574 and S precision 0.4214 -> 0.4419: the
+model became slightly *more conservative*, not more sensitive. `best_epoch`
+was 1 again.
 
-**But S vanished entirely.** E4 predicts S **11 times in total** against 1,836
-true S beats: S-F1 0.0000, S recall 0.0000. macro-F1 0.5602, second-worst of
-any run. 16,283 parameters cannot represent the S class at all.
+So the RR signal is **not** attenuated by network depth. I flagged in E5's
+report that a 5-wide skip against a 64-wide vector was a weak intervention and
+that a null result should not be over-read - that caveat stands, but the
+direction of the change (recall down, precision up) argues against attenuation
+rather than merely failing to confirm it.
 
-Taken together: overfitting was never the binding constraint on S. Shrinking
-the network removed the symptom I was chasing and made the actual problem
-worse. E5 goes back to E2's capacity and attacks the RR attenuation instead.
-
-**Prediction 1 is unverifiable and that is a gap I should close.** No run
-records its parameter count, so I have been predicting a number that no
-artefact can confirm or refute. Worth adding `model_parameters` to
-`metrics.json` in a future step - flagged rather than done, since E5's brief
-was one change to `build_model`.
+**Two hypotheses are now eliminated.** E4: S is not limited by overfitting -
+cutting capacity 14.7x moved `best_epoch` off 1 and destroyed S completely
+(11 predictions in 1,836). E5: S is not limited by RR attenuation. What
+remains is that the model is never *asked* to predict S: N outnumbers S 60:1
+in every minibatch it has ever seen.
 
 ---
 
 ## What changed
 
-**Capacity restored to E2's sizes** - conv 32/32/64/64/128/128, BiLSTM 64,
-head Dense 128/64. Read back out of the AST to confirm:
+**Part 1 - the E5 skip is gone.** `build_model`'s layer graph is byte-identical
+to E2's again.
 
-```
-Conv1D (filters, kernel): [(32, 5), (32, 5), (64, 5), (64, 5), (128, 3), (128, 3)]
-LSTM units             : [64]
-Dense units in order   : [16, 128, 64, NUM_CLASSES]
-```
+**Part 2 - balanced batch sampling:**
 
-The `16` is the RR branch, untouched.
+- Section 18 no longer calls `augment_training_data()`. `X_tr_aug` etc. pass
+  straight through; the function has **zero call sites** and sections 9 and 10
+  are marked `[DEPRECATED]`.
+- New section **19B** builds three per-class `tf.data.Dataset`s, each
+  `.shuffle(n_class, seed=SEED).repeat()`, combined by
+  `tf.data.Dataset.sample_from_datasets(weights=[1/3, 1/3, 1/3], seed=SEED)`,
+  then `.batch(BATCH_SIZE).prefetch(AUTOTUNE)`.
+- `STEPS_PER_EPOCH = ceil(44076 / 128) = 345`, passed explicitly to
+  `model.fit`, which now receives `train_dataset` positionally and **no**
+  `batch_size` (illegal alongside a Dataset).
+- Loss is plain `'categorical_crossentropy'`. `categorical_focal_loss` has
+  zero call sites and its section is marked `[DEPRECATED]`.
+- `metrics.json` config gains `sampler`, `sampling_weights`,
+  `steps_per_epoch`, `loss`, `focal_loss_used` and **`total_parameters`**.
 
-**The skip connection** - four lines, immediately after the last dropout and
-before the output:
-
-```python
-    combined = Dropout(0.4)(combined)
-
-    # DIRECT RR SKIP (E5)
-    combined = Concatenate()([
-        combined,
-        rr_input
-    ])
-
-    # OUTPUT
-    output = Dense(NUM_CLASSES, activation='softmax')(combined)
-```
-
-`rr_input` is the raw 5-feature tensor, not `rr_branch`. The existing branch -
-`Dense(16)` then `Dropout(0.2)` into the 144-wide concatenation - is
-completely unaltered. This is an addition, not a replacement, so the output
-layer now sees the RR features by two routes: one deeply transformed, one
-untouched.
+**No synthetic data is created.** S beats repeat from the 670 real ones inside
+an infinite stream, so hard constraint 2 holds - the first time it has since
+E0.
 
 ---
 
-## Layer table
+## One instruction I could not satisfy literally
+
+You asked that `build_model` "must return to being byte-identical to E2's",
+and separately that the focal loss be replaced with cross-entropy.
+**`model.compile()` lives inside `build_model`**, so both cannot hold.
+
+The layer graph *is* byte-identical - I verified it by slicing everything
+before `model.compile(` from both versions and comparing:
 
 ```
-E) E5 layer table
-   layer                      output             params
-   ----------------------------------------------------
-   Input ecg                  (234, 9)                -
-   Conv1D k5                  (234, 32)           1,472
-   BatchNorm                  (234, 32)             128
-   Conv1D k5                  (234, 32)           5,152
-   BatchNorm                  (234, 32)             128
-   MaxPool /2                 (117, 32)               -
-   Dropout 0.2                (117, 32)               -
-   Conv1D k5                  (117, 64)          10,304
-   BatchNorm                  (117, 64)             256
-   Conv1D k5                  (117, 64)          20,544
-   BatchNorm                  (117, 64)             256
-   MaxPool /2                 (58, 64)                -
-   Dropout 0.25               (58, 64)                -
-   Conv1D k3                  (58, 128)          24,704
-   BatchNorm                  (58, 128)             512
-   Conv1D k3                  (58, 128)          49,280
-   BatchNorm                  (58, 128)             512
-   MaxPool /2                 (29, 128)               -
-   Dropout 0.3                (29, 128)               -
-   Bidirectional LSTM 64      (128,)             98,816
-   Dropout 0.4                (128,)                  -
-   Input rr                   (5,)                    -
-   Dense 16 (rr branch)       (16,)                  96
-   Dropout 0.2 (rr)           (16,)                   -
-   Concatenate                (144,)                  -
-   Dense 128                  (128,)             18,560
-   Dropout 0.5                (128,)                  -
-   Dense 64                   (64,)               8,256
-   Dropout 0.4                (64,)                   -
-   Concatenate (RR skip)      (69,)                   -
-   Dense 3 softmax            (3,)                  210
-   ----------------------------------------------------
-   TOTAL                                        239,186
-
-   output Dense inputs: 64 + 5 = 69
-   output Dense params: 69*3 + 3 = 210   (was 64*3+3 = 195)
-   E2 239171 -> E5 239186  = +15 parameters
+layer graph (everything before model.compile) byte-identical to E2: True
 ```
 
-**Total: 239,186 = E2's 239,171 + 15.** The only parameter change is the
-output layer: `69*3 + 3 = 210` against `64*3 + 3 = 195`.
+The entire remaining diff inside `build_model` is the loss argument:
 
-**The counting method is validated against two known totals before being
-trusted**: the same formulas reproduce E2's **239,171** and E4's **16,283**
-exactly.
+```diff
+-        loss=categorical_focal_loss(
+-            alpha=FOCAL_ALPHA,
+-            gamma=FOCAL_GAMMA
+-        ),
++        loss='categorical_crossentropy',
+```
+
+Parameter count is unaffected by the loss: **239,171**, confirmed by the
+same analytic method that reproduces E2's and E4's known totals.
 
 ---
 
@@ -133,105 +96,171 @@ exactly.
 
 **py_compile** - passed, exit code 0.
 
-**`ast.dump` against E4 HEAD:**
+**`ast.dump` against E5 HEAD:** `changed: ['build_model']`, nothing added or
+removed. Sections 18, 19B and the fit call are module-level, so they do not
+appear in a function diff.
+
+**`augment_training_data` call graph** (AST, not grep): **called from
+NOWHERE**. `categorical_focal_loss`: **zero call sites**. `compile` uses
+`'categorical_crossentropy'`.
+
+**Sampler structure, read from the AST:** one `sample_from_datasets` call with
+`weights=SAMPLING_WEIGHTS, seed=SEED`; `SAMPLING_WEIGHTS` evaluates to
+`[0.333333, 0.333333, 0.333333]` summing to 1.0; three `.shuffle`, three
+`.repeat`, one `.batch(BATCH_SIZE)`; `model.fit(train_dataset, ...,
+steps_per_epoch=..., ...)` with **no** `batch_size` kwarg.
+
+**Empirical sampler check - and its limitation.** TensorFlow is not installed
+locally, so `tf.data` cannot be executed here. I simulated the documented
+semantics of `sample_from_datasets` in numpy - a categorical draw over three
+infinite shuffled streams with weights 1/3 - and drew 20 batches of 128:
 
 ```
-changed : ['build_model']
-added   : NONE
-removed : NONE
+   20 batches of 128, per-class counts (target 42.7 each):
+    batch      N      S      V   max deviation
+        1     43     43     42        0.7
+        2     45     40     43        2.7
+        3     45     42     41        2.3
+        4     44     42     42        1.3
+        5     37     43     48        5.7
+        6     52     38     38        9.3
+        7     41     41     46        3.3
+        8     45     42     41        2.3
+        9     37     43     48        5.7
+       10     52     40     36        9.3
+       11     39     49     40        6.3
+       12     39     47     42        4.3
+       13     46     37     45        5.7
+       14     39     35     54       11.3
+       15     43     47     38        4.7
+       16     41     47     40        4.3
+       17     48     42     38        5.3
+       18     43     41     44        1.7
+       19     49     38     41        6.3
+       20     37     55     36       12.3
+
+   mean per class over 20 batches: N 43.25  S 42.60  V 42.15
+   overall share: N 0.3379  S 0.3328  V 0.3293
+   multinomial std per class: 5.33  (observed 4.45)
+   worst single-batch deviation from 42.7: 12 (2.3 sd)
+
+C) what balanced sampling does to how often each beat is seen
 ```
 
-`build_model` is the **only** changed function, as required.
+Mean per class 43.25 / 42.60 / 42.15 against a target of 42.67; overall shares
+0.3379 / 0.3328 / 0.3293; no class ever absent from a batch. The spread is
+ordinary multinomial noise (theoretical sd 5.33, worst single-batch deviation
+2.3 sd).
 
-**Against E2 (post-fix), the comparison that matters:** `build_model` is again
-the only differing function, and its entire code diff is the four-line
-concatenate above - every other diff line is comment. Outside `build_model`,
-the source differs from E2 in **18 lines, 0 of them code** (the comment I
-added at E4 recording E3's failure).
+**This validates the sampling scheme, not `tf.data`'s implementation of it.**
+The Kaggle run is the first execution of the real pipeline, and the printed
+per-class counts should be compared against the table above.
 
-**So E5 is exactly E2 plus a skip connection.** Not approximately - the module
-level is code-identical.
-
-**Wavelet widths still match E2 to 4 decimals**: 8.1028, 4.0514, 2.7009,
-2.0257, 1.6206, 1.3505, 1.1575, 1.0129, 0.9003. Confirmed independently on
-record 209: per-channel std is `[2.6169, 2.2094, 1.4953, 0.9834, 0.6684,
-0.4742, 0.3495, 0.2659, 0.2086]`, identical to E2's.
-
-**Skip placement checked structurally**, not by eye: two `Concatenate()` call
-sites, one with `[x, rr_branch]` (the original) and one with
-`[combined, rr_input]` (the skip); the skip's source position sits after the
-last `Dropout(0.4)` and before `output = Dense(`.
-
-**Constants unchanged** (one occurrence each): `PRE_SAMPLES = 90`,
-`POST_SAMPLES = 144`, `FOCAL_ALPHA = 0.50`, `FOCAL_GAMMA = 2.0`,
+**Constants and literals unchanged**: `PRE_SAMPLES = 90`, `POST_SAMPLES = 144`,
 `ADAM_LEARNING_RATE = 1e-4`, `RR_LOCAL_WINDOW = 10`, `RR_CLIP_MIN = 0.2`,
-`RR_CLIP_MAX = 3.0`, `SAMPLING_RATE_HZ = 360.0`. Augmentation multipliers
-`[0, 6, 2, 0]` identical. `rr = [...]` and `RR_FEATURE_NAMES` byte-identical.
+`RR_CLIP_MAX = 3.0`, `SAMPLING_RATE_HZ = 360.0`, `BATCH_SIZE = 128` - one
+occurrence each. `rr = [...]` and `RR_FEATURE_NAMES` byte-identical.
+`WAVELET_TARGET_FREQS_HZ` identical to E2's, widths 8.1028 ... 0.9003.
 `DS1` `9f20e3ac1758a312...`, `DS2` `b8a3e6bbdeeec72a...`, `DS1_VAL`
 `0d9df3612a6111a1...` = `['207','220','223']`.
 
 ---
 
+## What balanced sampling actually does to exposure
+
+This is the part worth pausing on before reading the result.
+
+```
+C) what balanced sampling does to how often each beat is seen
+   samples per epoch: 345 steps x 128 = 44160
+   cls    beats  draws/epoch     times seen
+   N      40301        14720           0.37
+   S        670        14720          21.97
+   V       3105        14720           4.74
+
+   For comparison, the augmentation E6 removes gave each S beat
+   7 copies per epoch. The sampler shows each S beat ~22 times.
+   And only 37% of the N pool is seen in a given epoch.
+
+D) results
+```
+
+**Each S beat is now seen about 22 times per epoch** - three times more
+repetition than the sevenfold augmentation E6 just removed. And **only 37% of
+the N pool is seen in any given epoch**: the model now sees roughly 14,720 N
+beats per epoch instead of 40,301.
+
+Both follow directly from equal weights plus a fixed 345-step epoch, and both
+are intended. But "no synthetic data" is not the same as "no repetition", and
+the constraint-2 argument for this change should not be read as an argument
+that repetition has gone away - it has increased for S.
+
+---
+
 ## Falsifiable predictions
 
-1. **Total parameters: 239,186.** Output Dense reports 210 rather than 195;
-   every other layer matches E2's summary line for line. (Not checkable from
-   `metrics.json` today - see the E4 scorecard note.)
-2. **425 steps/epoch**, `train_distribution` N=40301 / S=670 / V=3105,
-   `wavelet_centre_frequencies` exactly `[10, 20, ..., 90]`.
-3. **S-F1 will exceed E2's 0.2686.** This is the bet. The skip gives the
-   output layer an un-attenuated view of the one feature block where the S
-   signal demonstrably lives. **If S-F1 does not move, the RR signal is not
-   being attenuated by depth** - it is either already sufficient at the
-   output, or the 5 ratios simply do not separate S from N well enough, and
-   the next step is a better S feature rather than a better path to it.
-4. **N-F1 and V-F1 will move very little** from E2's 0.9787 and 0.9111. Fifteen
-   extra parameters cannot restructure the ECG pathway; if V-F1 shifts by more
-   than a point or two, something other than the skip is in play and the run
-   is not the clean ablation it looks like.
+1. **345 steps/epoch**, `config.sampler == "balanced_batch"`,
+   `sampling_weights == [1/3, 1/3, 1/3]`, `loss == "categorical_crossentropy"`,
+   `focal_loss_used == false`, `oversampling == false`, and
+   **`total_parameters == 239171`** - the first run where that last claim is
+   checkable from the artefact.
+2. **S recall will rise sharply, well past E2's 0.1972** - I expect above 0.60.
+   This is the mechanism De Waele et al. attribute their 0.9116 to, and it is
+   the first time our model will see S in a third of its training signal.
+3. **S precision will fall well below E2's 0.4214** - probably under 0.20.
+   Their S precision is 0.3327 *with* RR fusion; a balanced sampler trades
+   precision for recall, and our N pool is 60x larger than theirs relative to S.
+   **Whether S-F1 beats 0.2686 depends entirely on which moves further**, and I
+   am not confident in the direction.
+4. **N-F1 will drop from 0.9787**, because N is now a third of the training
+   signal rather than 91% of it. If N-F1 holds above 0.95 the sampler is
+   under-firing; if it falls below 0.90 it is over-firing.
 
-Prediction 3 is the experiment; prediction 4 is the control.
+Prediction 2 is the mechanism test. Prediction 3 is the cost. Prediction 1 is
+the integrity check.
 
 ---
 
 ## Commit
 
 ```
-986dc29  E5: direct RR skip connection to the output layer
+5b3b203  E6: balanced batch sampling with plain cross-entropy
 ```
 
-Pushed to `origin/main`. `docs/ablation.md` now carries 12 runs including E4.
+Pushed to `origin/main`. `docs/ablation.md` now carries 13 runs including E5.
 
 ---
 
 ## Problems
 
-1. **No run records its parameter count**, so my parameter predictions cannot
-   be checked against any artefact. I have now made three of them. Adding
-   `model_parameters: model.count_params()` to the metrics config would close
-   this in one line - flagged, not done, because E5's brief was one change to
-   `build_model`.
+1. **The sampler is untested against `tf.data` itself.** No TensorFlow
+   locally means the first real execution is on Kaggle. The AST check
+   guarantees the call shape; the numpy simulation guarantees the scheme is
+   sound; neither guarantees `sample_from_datasets` behaves as documented in
+   TF 2.20. If the printed per-class counts are not near 42.7, that is where
+   to look first.
 
-2. **A 5-wide skip against a 64-wide feature vector is a weak intervention.**
-   The output layer sees 69 inputs of which 5 are the raw RR features. If the
-   attenuation hypothesis is right but the effect is small, this may not be
-   enough to show it. A stronger test - had it been in scope - would widen the
-   RR path rather than add a thin bypass. Worth knowing before reading a null
-   result as a refutation.
+2. **S repetition went up, not down** - ~22 times per epoch against
+   augmentation's 7. Constraint 2 is satisfied because nothing synthetic is
+   created, but if E6 overfits S, the repetition rate is the reason, and the
+   fix would be fewer steps per epoch rather than a different sampler.
 
-3. **E5 is two changes against E4** (capacity restore + skip) but **one change
-   against E2**. E2 is the correct comparison and the report treats it that
-   way; the ablation table's row order should not be read as implying E4 is
-   the baseline.
+3. **Only 37% of N is seen per epoch.** With `EPOCHS = 40` and early stopping
+   typically firing well before that, some N beats may never be sampled in a
+   short run. That is a real change to what the model is trained on, not just
+   how often.
 
-4. **The dropout before the skip still applies to the CNN/LSTM path only.**
-   The raw `rr_input` bypasses every dropout in the network, so those 5
-   features are the only inputs to the output layer that are never dropped.
-   That is the intent, but it does mean the output layer can learn to lean on
-   them heavily without the usual regularisation pressure - a plausible
-   overfitting route on 670 unique S beats.
+4. **Three things changed at once**: the E5 skip removed, augmentation
+   removed, loss changed, sampler added. Against E2 that is three variables
+   (sampler, loss, no augmentation - the skip is absent from both). If E6
+   moves S sharply, attributing the gain between the sampler and the loss will
+   require a follow-up run.
 
-5. Carried over: hard constraint 2 still violated (augmentation on); threshold
-   tuning has failed to transfer twice; record 114 lead swap unfixed; record
-   207 still a validation outlier; `tools/inspect_ds1.py` JSON stale; stale
-   root `__pycache__/`.
+5. **`X_raw_train` is now unused.** `load_dataset` still computes and returns
+   the z-scored raw waveforms for every split, but nothing consumes them since
+   augmentation stopped. Harmless (~46 MB for DS2) and left in place because
+   removing it would touch `load_dataset`, which was out of scope.
+
+6. Carried over: threshold tuning has failed to transfer twice; record 114
+   lead swap unfixed; record 207 still a validation outlier;
+   `tools/inspect_ds1.py` JSON stale; stale root `__pycache__/`.
