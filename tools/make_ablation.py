@@ -139,6 +139,15 @@ RUNS = [
           lambda v: isinstance(v, list) and len(v) == 9
           and abs(v[0] - 10.0) < 1e-6 and abs(v[-1] - 90.0) < 1e-6},
      None),          # assembled from the artefacts - see e2_note()
+
+    ("E3", "E3_log_wavelet", "fe14c34",
+     "log-spaced wavelet scales 3-90 Hz",
+     {"run_name": "E3_log_wavelet",
+      "config.ds1_val": ["207", "220", "223"],
+      "config.wavelet_centre_frequencies":
+          lambda v: isinstance(v, list) and len(v) == 9
+          and abs(v[0] - 3.0) < 1e-6 and abs(v[-1] - 90.0) < 1e-6},
+     None),          # assembled from the artefacts - see e3_note()
 ]
 
 
@@ -330,7 +339,37 @@ def e2_note(m, h, gaps):
              tt=t["macro avg"]["f1-score"])
 
 
-ASSEMBLED = {"4": step4_note, "5": step5_note, "E1": e1_note, "E2": e2_note}
+def e3_note(m, h, gaps):
+    """E3 tested the sub-10 Hz hypothesis and refuted it."""
+    a = m["test_argmax"]["classification_report"]
+    e2 = json.load(open(os.path.join(RESULTS, "E2_wavelet_input",
+                                     "metrics.json")))
+    e2a = e2["test_argmax"]["classification_report"]
+    acc = h["accuracy"]
+    v = h["val_macro_f1"]
+    return (
+        "**Refuted the sub-10 Hz hypothesis: macro-F1 {m1:.4f} against E2's "
+        "{m0:.4f}, worse on every class** - N {n0:.4f} -> {n1:.4f}, "
+        "S {s0:.4f} -> {s1:.4f}, V {v0:.4f} -> {v1:.4f}. Four channels at "
+        "or below 10.74 Hz did not help S; whatever limits S here, it is "
+        "not the absence of P-wave frequency coverage. E4 reverts the "
+        "scales.\n\n"
+        "  **The run also made the real problem legible.** Train accuracy "
+        "climbs {a0:.4f} -> {a1:.4f} across {ne} epochs while validation "
+        "macro-F1 falls monotonically from its epoch-1 peak of {v1e:.4f} to "
+        "{vend:.4f}. `best_epoch` is **1**, as it was for E2. A "
+        "239,171-parameter network is memorising 670 unique S beats. That "
+        "is what E4 addresses by cutting capacity ~15x."
+    ).format(m1=a["macro avg"]["f1-score"], m0=e2a["macro avg"]["f1-score"],
+             n0=e2a["N"]["f1-score"], n1=a["N"]["f1-score"],
+             s0=e2a["S"]["f1-score"], s1=a["S"]["f1-score"],
+             v0=e2a["V"]["f1-score"], v1=a["V"]["f1-score"],
+             a0=acc[0], a1=acc[-1], ne=len(acc),
+             v1e=v[0], vend=v[-1])
+
+
+ASSEMBLED = {"4": step4_note, "5": step5_note, "E1": e1_note,
+             "E2": e2_note, "E3": e3_note}
 
 
 # --------------------------------------------------------------------- build

@@ -28,6 +28,7 @@ DS2. All metrics below are on DS2 (inter-patient test set).
 | E0 | re-anchor: step 3 training config, 5-record validation | `042597b` | 0.5591 | 0.0964 | 0.1758 | 0.1245 | 0.6002 | 0.8935 |
 | E1 | revert DS1_VAL to 3 records + validation-tuned thresholds | `3d3494b` | 0.6645 | 0.1514 | 0.3634 | 0.2138 | 0.8004 | 0.9451 |
 | E2 | 9-scale wavelet scalogram input (linear 10-90 Hz) | `11cd348` | 0.7178 | 0.1972 | 0.4214 | 0.2686 | 0.9111 | 0.9503 |
+| E3 | log-spaced wavelet scales 3-90 Hz | `fe14c34` | 0.6151 | 0.1013 | 0.2875 | 0.1498 | 0.7321 | 0.9270 |
 
 ## Notes
 
@@ -79,6 +80,11 @@ DS2. All metrics below are on DS2 (inter-patient test set).
 
   This run used the corrected normalization path (commit `11cd348`): its timestamp is 21:43 UTC, 12 minutes after that fix was committed at 21:31 UTC.
 
+- **step E3** (`E3_log_wavelet`) - train distribution N=40301 / S=670 / V=3105. Ran 11 epochs; selection on `val_macro_f1` chose **epoch 1** (best val macro-F1 0.6629); early stopping fired: True.
+  **Refuted the sub-10 Hz hypothesis: macro-F1 0.6151 against E2's 0.7178, worse on every class** - N 0.9735 -> 0.9635, S 0.2686 -> 0.1498, V 0.9111 -> 0.7321. Four channels at or below 10.74 Hz did not help S; whatever limits S here, it is not the absence of P-wave frequency coverage. E4 reverts the scales.
+
+  **The run also made the real problem legible.** Train accuracy climbs 0.8011 -> 0.9717 across 11 epochs while validation macro-F1 falls monotonically from its epoch-1 peak of 0.6629 to 0.5406. `best_epoch` is **1**, as it was for E2. A 239,171-parameter network is memorising 670 unique S beats. That is what E4 addresses by cutting capacity ~15x.
+
 ## Test-minus-validation gap
 
 A model selected on a trustworthy validation signal should not score wildly
@@ -93,6 +99,7 @@ differently on test. The gap is `test macro-F1 - best_val_macro_f1`:
 | E0 | 0.5911 | 0.5591 | -0.0320 |
 | E1 | 0.5618 | 0.6645 | +0.1027 |
 | E2 | 0.5557 | 0.7178 | +0.1621 |
+| E3 | 0.6629 | 0.6151 | -0.0477 |
 
 Steps 2 and 3 scored **above** validation, which is the expected direction
 when validation holds only three patients and two of them are hard. Step 4 is

@@ -225,29 +225,17 @@ SEGMENT_LENGTH = PRE_SAMPLES + POST_SAMPLES
 # window, late-fused RR features, 23,619 parameters); the input
 # representation is the one ingredient we can adopt directly.
 #
-# E3 re-spaces the same 9 scales from linear 10..90 Hz to LOG-spaced
-# 3..90 Hz. E2's linear set had zero channels below 10 Hz, and P-wave
-# energy - the thing that distinguishes an S beat - lies largely below
-# that. It also spent two channels at 60 and 70 Hz that correlated at
-# 0.9968. Log spacing buys resolution at the low end and stops wasting it
-# at the top. The channel COUNT is unchanged, so the model is unchanged.
+# E3 tried re-spacing these 9 scales to LOG-spaced 3..90 Hz, reasoning
+# that P-wave energy sits below 10 Hz. It scored macro-F1 0.6151 against
+# E2's 0.7178 and lost on every class, so E4 REVERTS to E2's linear
+# 10..90 Hz. Whatever limits S here, it is not the absence of
+# sub-10 Hz channels.
 #
 # Widths are DERIVED from these target centre frequencies, never
 # hardcoded - see section 6B.
 SAMPLING_RATE_HZ = 360.0
 
-WAVELET_F_MIN_HZ = 3.0
-WAVELET_F_MAX_HZ = 90.0
-N_WAVELET_SCALES_TARGET = 9
-
-WAVELET_TARGET_FREQS_HZ = [
-    float(
-        WAVELET_F_MIN_HZ
-        * (WAVELET_F_MAX_HZ / WAVELET_F_MIN_HZ)
-        ** (k / (N_WAVELET_SCALES_TARGET - 1.0))
-    )
-    for k in range(N_WAVELET_SCALES_TARGET)
-]
+WAVELET_TARGET_FREQS_HZ = [float(10 * k) for k in range(1, 10)]
 
 # Patient-relative RR features (step 3).
 # Raw RR intervals in samples are not comparable across patients: 280
@@ -1255,7 +1243,7 @@ def build_model(ecg_shape, rr_shape):
 
     # CNN BLOCK 1
     x = Conv1D(
-        32,
+        8,
         kernel_size=5,
         activation='relu',
         padding='same'
@@ -1264,7 +1252,7 @@ def build_model(ecg_shape, rr_shape):
     x = BatchNormalization()(x)
 
     x = Conv1D(
-        32,
+        8,
         kernel_size=5,
         activation='relu',
         padding='same'
@@ -1278,7 +1266,7 @@ def build_model(ecg_shape, rr_shape):
 
     # CNN BLOCK 2
     x = Conv1D(
-        64,
+        16,
         kernel_size=5,
         activation='relu',
         padding='same'
@@ -1287,7 +1275,7 @@ def build_model(ecg_shape, rr_shape):
     x = BatchNormalization()(x)
 
     x = Conv1D(
-        64,
+        16,
         kernel_size=5,
         activation='relu',
         padding='same'
@@ -1301,7 +1289,7 @@ def build_model(ecg_shape, rr_shape):
 
     # CNN BLOCK 3
     x = Conv1D(
-        128,
+        32,
         kernel_size=3,
         activation='relu',
         padding='same'
@@ -1310,7 +1298,7 @@ def build_model(ecg_shape, rr_shape):
     x = BatchNormalization()(x)
 
     x = Conv1D(
-        128,
+        32,
         kernel_size=3,
         activation='relu',
         padding='same'
@@ -1325,7 +1313,7 @@ def build_model(ecg_shape, rr_shape):
     # BiLSTM
     x = Bidirectional(
         LSTM(
-            64,
+            16,
             return_sequences=False
         )
     )(x)
@@ -1352,14 +1340,14 @@ def build_model(ecg_shape, rr_shape):
     ])
 
     combined = Dense(
-        128,
+        32,
         activation='relu'
     )(combined)
 
     combined = Dropout(0.5)(combined)
 
     combined = Dense(
-        64,
+        16,
         activation='relu'
     )(combined)
 
