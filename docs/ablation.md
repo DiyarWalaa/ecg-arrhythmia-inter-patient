@@ -29,6 +29,7 @@ DS2. All metrics below are on DS2 (inter-patient test set).
 | E1 | revert DS1_VAL to 3 records + validation-tuned thresholds | `3d3494b` | 0.6645 | 0.1514 | 0.3634 | 0.2138 | 0.8004 | 0.9451 |
 | E2 | 9-scale wavelet scalogram input (linear 10-90 Hz) | `11cd348` | 0.7178 | 0.1972 | 0.4214 | 0.2686 | 0.9111 | 0.9503 |
 | E3 | log-spaced wavelet scales 3-90 Hz | `fe14c34` | 0.6151 | 0.1013 | 0.2875 | 0.1498 | 0.7321 | 0.9270 |
+| E4 | revert to E2 scales, capacity 239,171 -> 16,283 | `cb9224e` | 0.5602 | 0.0000 | 0.0000 | 0.0000 | 0.7133 | 0.9309 |
 
 ## Notes
 
@@ -85,6 +86,13 @@ DS2. All metrics below are on DS2 (inter-patient test set).
 
   **The run also made the real problem legible.** Train accuracy climbs 0.8011 -> 0.9717 across 11 epochs while validation macro-F1 falls monotonically from its epoch-1 peak of 0.6629 to 0.5406. `best_epoch` is **1**, as it was for E2. A 239,171-parameter network is memorising 670 unique S beats. That is what E4 addresses by cutting capacity ~15x.
 
+- **step E4** (`E4_small_model`) - train distribution N=40301 / S=670 / V=3105. Ran 14 epochs; selection on `val_macro_f1` chose **epoch 4** (best val macro-F1 0.5242); early stopping fired: True.
+  **The capacity question was answered, and the model still failed.** `best_epoch` moved from 1 (E2, E3) to **4**, and final train accuracy fell 0.9003 against E3's 0.9717 - so the epoch-1 peak WAS a capacity artefact, exactly as predicted.
+
+  **But S collapsed to nothing: S-F1 0.0000, S recall 0.0000.** The network predicts S **11 times in total** against 1836 true S beats. macro-F1 0.5602 is the second-worst of any run. 16,283 parameters cannot represent the S class at all.
+
+  Both facts matter: reducing capacity fixed the early peak and destroyed the minority class, so overfitting was never the binding constraint on S. E5 returns to E2's capacity and attacks the attenuation of the RR signal instead.
+
 ## Test-minus-validation gap
 
 A model selected on a trustworthy validation signal should not score wildly
@@ -100,6 +108,7 @@ differently on test. The gap is `test macro-F1 - best_val_macro_f1`:
 | E1 | 0.5618 | 0.6645 | +0.1027 |
 | E2 | 0.5557 | 0.7178 | +0.1621 |
 | E3 | 0.6629 | 0.6151 | -0.0477 |
+| E4 | 0.5242 | 0.5602 | +0.0360 |
 
 Steps 2 and 3 scored **above** validation, which is the expected direction
 when validation holds only three patients and two of them are hard. Step 4 is

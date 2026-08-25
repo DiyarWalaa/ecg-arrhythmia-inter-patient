@@ -148,6 +148,15 @@ RUNS = [
           lambda v: isinstance(v, list) and len(v) == 9
           and abs(v[0] - 3.0) < 1e-6 and abs(v[-1] - 90.0) < 1e-6},
      None),          # assembled from the artefacts - see e3_note()
+
+    ("E4", "E4_small_model", "cb9224e",
+     "revert to E2 scales, capacity 239,171 -> 16,283",
+     {"run_name": "E4_small_model",
+      "config.ds1_val": ["207", "220", "223"],
+      "config.wavelet_centre_frequencies":
+          lambda v: isinstance(v, list) and len(v) == 9
+          and abs(v[0] - 10.0) < 1e-6},
+     None),          # assembled from the artefacts - see e4_note()
 ]
 
 
@@ -368,8 +377,33 @@ def e3_note(m, h, gaps):
              v1e=v[0], vend=v[-1])
 
 
+def e4_note(m, h, gaps):
+    """E4 answered its question and failed anyway - both worth recording."""
+    a = m["test_argmax"]["classification_report"]
+    cm = m["test_argmax"]["confusion_matrix"]
+    s_pred = sum(row[1] for row in cm)
+    s_true = sum(cm[1])
+    acc = h["accuracy"]
+    return (
+        "**The capacity question was answered, and the model still failed.** "
+        "`best_epoch` moved from 1 (E2, E3) to **{be}**, and final train "
+        "accuracy fell {a1:.4f} against E3's 0.9717 - so the epoch-1 peak WAS "
+        "a capacity artefact, exactly as predicted.\n\n"
+        "  **But S collapsed to nothing: S-F1 {s1:.4f}, S recall {sr:.4f}.** "
+        "The network predicts S **{sp} times in total** against {st} true S "
+        "beats. macro-F1 {m1:.4f} is the second-worst of any run. 16,283 "
+        "parameters cannot represent the S class at all.\n\n"
+        "  Both facts matter: reducing capacity fixed the early peak and "
+        "destroyed the minority class, so overfitting was never the binding "
+        "constraint on S. E5 returns to E2's capacity and attacks the "
+        "attenuation of the RR signal instead."
+    ).format(be=m["best_epoch"], a1=acc[-1], s1=a["S"]["f1-score"],
+             sr=a["S"]["recall"], sp=s_pred, st=s_true,
+             m1=a["macro avg"]["f1-score"])
+
+
 ASSEMBLED = {"4": step4_note, "5": step5_note, "E1": e1_note,
-             "E2": e2_note, "E3": e3_note}
+             "E2": e2_note, "E3": e3_note, "E4": e4_note}
 
 
 # --------------------------------------------------------------------- build

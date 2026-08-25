@@ -1243,7 +1243,7 @@ def build_model(ecg_shape, rr_shape):
 
     # CNN BLOCK 1
     x = Conv1D(
-        8,
+        32,
         kernel_size=5,
         activation='relu',
         padding='same'
@@ -1252,7 +1252,7 @@ def build_model(ecg_shape, rr_shape):
     x = BatchNormalization()(x)
 
     x = Conv1D(
-        8,
+        32,
         kernel_size=5,
         activation='relu',
         padding='same'
@@ -1266,7 +1266,7 @@ def build_model(ecg_shape, rr_shape):
 
     # CNN BLOCK 2
     x = Conv1D(
-        16,
+        64,
         kernel_size=5,
         activation='relu',
         padding='same'
@@ -1275,7 +1275,7 @@ def build_model(ecg_shape, rr_shape):
     x = BatchNormalization()(x)
 
     x = Conv1D(
-        16,
+        64,
         kernel_size=5,
         activation='relu',
         padding='same'
@@ -1289,7 +1289,7 @@ def build_model(ecg_shape, rr_shape):
 
     # CNN BLOCK 3
     x = Conv1D(
-        32,
+        128,
         kernel_size=3,
         activation='relu',
         padding='same'
@@ -1298,7 +1298,7 @@ def build_model(ecg_shape, rr_shape):
     x = BatchNormalization()(x)
 
     x = Conv1D(
-        32,
+        128,
         kernel_size=3,
         activation='relu',
         padding='same'
@@ -1313,7 +1313,7 @@ def build_model(ecg_shape, rr_shape):
     # BiLSTM
     x = Bidirectional(
         LSTM(
-            16,
+            64,
             return_sequences=False
         )
     )(x)
@@ -1340,18 +1340,36 @@ def build_model(ecg_shape, rr_shape):
     ])
 
     combined = Dense(
-        32,
+        128,
         activation='relu'
     )(combined)
 
     combined = Dropout(0.5)(combined)
 
     combined = Dense(
-        16,
+        64,
         activation='relu'
     )(combined)
 
     combined = Dropout(0.4)(combined)
+
+    # DIRECT RR SKIP (E5)
+    #
+    # The RR branch already feeds the 144-wide concatenation, but by the
+    # time it reaches the output it has passed Dense(16) -> Dropout(0.2)
+    # -> concat (11% of the vector) -> Dense(128) -> Dropout(0.5) ->
+    # Dense(64) -> Dropout(0.4). The S-class signal lives in RR, and a
+    # single threshold on pre_RR_over_local alone reaches S-F1 0.1515
+    # against the full network's 0.2686 - the network adds only 0.12 over
+    # one hand-computed ratio.
+    #
+    # This gives the output layer an un-attenuated view: the RAW rr_input
+    # tensor, concatenated straight onto the last dropout. The existing
+    # branch is untouched; this is an addition, not a replacement.
+    combined = Concatenate()([
+        combined,
+        rr_input
+    ])
 
     # OUTPUT
     output = Dense(
