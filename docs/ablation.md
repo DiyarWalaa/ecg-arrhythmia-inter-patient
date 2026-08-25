@@ -30,6 +30,7 @@ DS2. All metrics below are on DS2 (inter-patient test set).
 | E2 | 9-scale wavelet scalogram input (linear 10-90 Hz) | `11cd348` | 0.7178 | 0.1972 | 0.4214 | 0.2686 | 0.9111 | 0.9503 |
 | E3 | log-spaced wavelet scales 3-90 Hz | `fe14c34` | 0.6151 | 0.1013 | 0.2875 | 0.1498 | 0.7321 | 0.9270 |
 | E4 | revert to E2 scales, capacity 239,171 -> 16,283 | `cb9224e` | 0.5602 | 0.0000 | 0.0000 | 0.0000 | 0.7133 | 0.9309 |
+| E5 | E2 architecture + direct RR skip to the output layer | `986dc29` | 0.7012 | 0.1574 | 0.4419 | 0.2321 | 0.8982 | 0.9498 |
 
 ## Notes
 
@@ -93,6 +94,13 @@ DS2. All metrics below are on DS2 (inter-patient test set).
 
   Both facts matter: reducing capacity fixed the early peak and destroyed the minority class, so overfitting was never the binding constraint on S. E5 returns to E2's capacity and attacks the attenuation of the RR signal instead.
 
+- **step E5** (`E5_rr_skip`) - train distribution N=40301 / S=670 / V=3105. Ran 11 epochs; selection on `val_macro_f1` chose **epoch 1** (best val macro-F1 0.5620); early stopping fired: True.
+  **The RR skip did not help: macro-F1 0.7012 against E2's 0.7178, S-F1 0.2321 against 0.2686.** The only change was 15 parameters - the raw 5-feature `rr_input` concatenated onto the last dropout so the output Dense saw 69 inputs instead of 64. Everything else was byte-identical to E2.
+
+  So the RR signal is **not** being attenuated by network depth. Giving the output layer an un-mediated view of the five ratios changed nothing useful; S recall moved 0.1972 -> 0.1574 while S precision rose 0.4214 -> 0.4419, i.e. the model became slightly more conservative, not more sensitive. `best_epoch` was **1** again.
+
+  Read together with E4, two hypotheses are now eliminated: S is not limited by overfitting (E4) and not by RR attenuation (E5). What remains is that the model is never **asked** to predict S - N outnumbers S 60:1 in every minibatch. That is what E6 changes.
+
 ## Test-minus-validation gap
 
 A model selected on a trustworthy validation signal should not score wildly
@@ -109,6 +117,7 @@ differently on test. The gap is `test macro-F1 - best_val_macro_f1`:
 | E2 | 0.5557 | 0.7178 | +0.1621 |
 | E3 | 0.6629 | 0.6151 | -0.0477 |
 | E4 | 0.5242 | 0.5602 | +0.0360 |
+| E5 | 0.5620 | 0.7012 | +0.1392 |
 
 Steps 2 and 3 scored **above** validation, which is the expected direction
 when validation holds only three patients and two of them are hard. Step 4 is

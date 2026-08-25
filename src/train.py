@@ -685,13 +685,13 @@ def load_dataset(
 
 
 # =========================================================
-# 9. ECG AUGMENTATION
+# 9. ECG AUGMENTATION  [DEPRECATED - unused since E6]
 # =========================================================
 
-# LIVE AGAIN as of E0. Reached via augment_training_data() in section 18.
-# This is data expansion and it conflicts with hard constraint 2; it is
-# re-enabled deliberately to reproduce the step 3 training configuration
-# on the step 5 validation set. See docs/ablation.md.
+# DEPRECATED. Reachable only from augment_training_data(), which is
+# itself no longer called. Class balance is handled by the sampler in
+# section 19B. Do not re-enable: synthetic beats violate hard
+# constraint 2.
 
 def augment_segment(segment):
 
@@ -739,15 +739,14 @@ def augment_segment(segment):
 
 
 # =========================================================
-# 10. TARGETED AUGMENTATION
+# 10. TARGETED AUGMENTATION  [DEPRECATED - unused since E6]
 # =========================================================
 
-# LIVE AGAIN as of E0: called from section 18, expanding S x7 and V x3.
-# Known defects, unchanged from step 3 and deliberately not fixed here:
-# the RR feature vector is copied UNCHANGED across every duplicate, and
-# the np.roll time shift moves the R-peak off its aligned position. This
-# violates hard constraint 2. E0 accepts that to re-establish a clean
-# baseline; removing it again is a later step.
+# DEPRECATED. augment_training_data() has zero call sites as of E6;
+# section 18 passes the training arrays straight through and section 19B
+# balances the classes by SAMPLING real beats with replacement instead of
+# fabricating copies. Do not re-enable: it violates hard constraint 2,
+# and it copied the RR feature vector unchanged across every duplicate.
 
 def augment_training_data(
     X,
@@ -842,8 +841,13 @@ def augment_training_data(
 
 
 # =========================================================
-# 11. MULTICLASS FOCAL LOSS
+# 11. MULTICLASS FOCAL LOSS  [DEPRECATED - unused since E6]
 # =========================================================
+
+# DEPRECATED. Not called anywhere: E6 compiles with plain
+# 'categorical_crossentropy'. FOCAL_ALPHA and FOCAL_GAMMA are likewise
+# retained but unused - metrics.json records loss and focal_loss_used so
+# a run is never ambiguous about which was active.
 
 def categorical_focal_loss(
     alpha,
@@ -1198,15 +1202,22 @@ print(f"\nTrain beats: {len(y_tr)}   Validation beats: {len(y_val)}")
 
 
 # =========================================================
-# 18. AUGMENT TRAINING DATA
+# 18. AUGMENT TRAINING DATA (REMOVED - E6)
 # =========================================================
 
-X_tr_aug, RR_tr_aug, y_tr_aug = augment_training_data(
-    X_tr,
-    X_raw_train,
-    RR_tr,
-    y_tr
-)
+# Duplicate oversampling is gone again. Class balance now comes from the
+# SAMPLER in section 19B: every minibatch holds an equal number of N, S
+# and V beats, drawn WITH REPLACEMENT from the real beats. No synthetic
+# data is created, so hard constraint 2 holds.
+#
+# The *_aug names are kept so nothing downstream needs to change.
+
+X_tr_aug = X_tr
+RR_tr_aug = RR_tr
+y_tr_aug = y_tr
+
+print(f"\nTraining samples (no oversampling): {len(y_tr_aug)}")
+print(f"Training distribution: {Counter(y_tr_aug)}")
 
 
 # =========================================================
@@ -1227,6 +1238,68 @@ y_test_cat = tf.keras.utils.to_categorical(
     y_test_encoded,
     num_classes=NUM_CLASSES
 )
+
+
+# =========================================================
+# 19B. BALANCED BATCH SAMPLING
+# =========================================================
+
+# De Waele et al. (2026) evaluate on MIT-BIH DS1->DS2, 3 classes, F and Q
+# excluded - our exact protocol - and report S-F1 0.4861 with RR late
+# fusion. Our S PRECISION (0.4214) already beats their 0.3327; the whole
+# gap is recall (0.1972 against 0.9116). Their INCART training set holds
+# 605 SVEB beats against our 670, so this is not a data-quantity effect.
+# The mechanism is balanced batch sampling.
+#
+# Every minibatch holds an equal number of N, S and V beats. S beats are
+# drawn WITH REPLACEMENT from the 670 real ones - repetition inside a
+# stream, not fabricated data, so hard constraint 2 holds.
+
+SAMPLER = "balanced_batch"
+
+SAMPLING_WEIGHTS = [1.0 / NUM_CLASSES] * NUM_CLASSES
+
+STEPS_PER_EPOCH = int(np.ceil(len(y_tr_aug) / BATCH_SIZE))
+
+_per_class_datasets = []
+
+for _class_index in range(NUM_CLASSES):
+
+    _mask = (y_tr_aug == _class_index)
+    _n_class = int(_mask.sum())
+
+    print(f"  sampler class {INT_TO_LABEL[_class_index]}: "
+          f"{_n_class} real beats")
+
+    _class_ds = tf.data.Dataset.from_tensor_slices((
+        (X_tr_aug[_mask], RR_tr_aug[_mask]),
+        y_tr_aug_cat[_mask]
+    ))
+
+    # Shuffle the whole class pool, then repeat forever. With replacement
+    # across epochs: the 670 S beats recycle far more often than the
+    # 40,301 N beats, which is the point.
+    _class_ds = _class_ds.shuffle(
+        _n_class,
+        seed=SEED,
+        reshuffle_each_iteration=True
+    ).repeat()
+
+    _per_class_datasets.append(_class_ds)
+
+train_dataset = tf.data.Dataset.sample_from_datasets(
+    _per_class_datasets,
+    weights=SAMPLING_WEIGHTS,
+    seed=SEED
+)
+
+train_dataset = train_dataset.batch(
+    BATCH_SIZE
+).prefetch(tf.data.AUTOTUNE)
+
+print(f"\nBalanced sampler: weights {SAMPLING_WEIGHTS}, "
+      f"batch {BATCH_SIZE}, {STEPS_PER_EPOCH} steps/epoch "
+      f"({len(y_tr_aug)} training beats / {BATCH_SIZE})")
 
 
 # =========================================================
@@ -1353,24 +1426,6 @@ def build_model(ecg_shape, rr_shape):
 
     combined = Dropout(0.4)(combined)
 
-    # DIRECT RR SKIP (E5)
-    #
-    # The RR branch already feeds the 144-wide concatenation, but by the
-    # time it reaches the output it has passed Dense(16) -> Dropout(0.2)
-    # -> concat (11% of the vector) -> Dense(128) -> Dropout(0.5) ->
-    # Dense(64) -> Dropout(0.4). The S-class signal lives in RR, and a
-    # single threshold on pre_RR_over_local alone reaches S-F1 0.1515
-    # against the full network's 0.2686 - the network adds only 0.12 over
-    # one hand-computed ratio.
-    #
-    # This gives the output layer an un-attenuated view: the RAW rr_input
-    # tensor, concatenated straight onto the last dropout. The existing
-    # branch is untouched; this is an addition, not a replacement.
-    combined = Concatenate()([
-        combined,
-        rr_input
-    ])
-
     # OUTPUT
     output = Dense(
         NUM_CLASSES,
@@ -1388,10 +1443,11 @@ def build_model(ecg_shape, rr_shape):
             learning_rate=ADAM_LEARNING_RATE
         ),
 
-        loss=categorical_focal_loss(
-            alpha=FOCAL_ALPHA,
-            gamma=FOCAL_GAMMA
-        ),
+        # E6: plain categorical cross-entropy. De Waele et al. reach
+        # S-F1 0.4861 on this protocol with standard CE plus a balanced
+        # sampler; stacking focal loss on top of balanced batches risks
+        # over-firing the S head. categorical_focal_loss is now unused.
+        loss='categorical_crossentropy',
 
         metrics=['accuracy']
     )
@@ -1536,8 +1592,7 @@ callbacks = [
 
 history = model.fit(
 
-    [X_tr_aug, RR_tr_aug],
-    y_tr_aug_cat,
+    train_dataset,
 
     validation_data=(
         [X_val, RR_val],
@@ -1546,7 +1601,7 @@ history = model.fit(
 
     epochs=EPOCHS,
 
-    batch_size=BATCH_SIZE,
+    steps_per_epoch=STEPS_PER_EPOCH,
 
     callbacks=callbacks,
 
@@ -2057,13 +2112,23 @@ metrics = {
 
         "LEAD_INDEX": LEAD_INDEX,
 
+        "loss": "categorical_crossentropy",
+
+        "focal_loss_used": False,
+
         "focal_loss_alpha": FOCAL_ALPHA,
 
         "focal_loss_gamma": FOCAL_GAMMA,
 
-        "oversampling": True,
+        "oversampling": False,
 
-        "oversampling_multipliers": {"N": 1, "S": 7, "V": 3},
+        "sampler": SAMPLER,
+
+        "sampling_weights": SAMPLING_WEIGHTS,
+
+        "steps_per_epoch": STEPS_PER_EPOCH,
+
+        "total_parameters": int(model.count_params()),
 
         "adam_learning_rate": ADAM_LEARNING_RATE,
 

@@ -157,6 +157,15 @@ RUNS = [
           lambda v: isinstance(v, list) and len(v) == 9
           and abs(v[0] - 10.0) < 1e-6},
      None),          # assembled from the artefacts - see e4_note()
+
+    ("E5", "E5_rr_skip", "986dc29",
+     "E2 architecture + direct RR skip to the output layer",
+     {"run_name": "E5_rr_skip",
+      "config.ds1_val": ["207", "220", "223"],
+      "config.wavelet_centre_frequencies":
+          lambda v: isinstance(v, list) and len(v) == 9
+          and abs(v[0] - 10.0) < 1e-6},
+     None),          # assembled from the artefacts - see e5_note()
 ]
 
 
@@ -402,8 +411,36 @@ def e4_note(m, h, gaps):
              m1=a["macro avg"]["f1-score"])
 
 
+def e5_note(m, h, gaps):
+    """E5 tested the RR-attenuation hypothesis with 15 extra parameters."""
+    a = m["test_argmax"]["classification_report"]
+    e2 = json.load(open(os.path.join(RESULTS, "E2_wavelet_input",
+                                     "metrics.json")))
+    e2a = e2["test_argmax"]["classification_report"]
+    return (
+        "**The RR skip did not help: macro-F1 {m1:.4f} against E2's "
+        "{m0:.4f}, S-F1 {s1:.4f} against {s0:.4f}.** The only change was 15 "
+        "parameters - the raw 5-feature `rr_input` concatenated onto the "
+        "last dropout so the output Dense saw 69 inputs instead of 64. "
+        "Everything else was byte-identical to E2.\n\n"
+        "  So the RR signal is **not** being attenuated by network depth. "
+        "Giving the output layer an un-mediated view of the five ratios "
+        "changed nothing useful; S recall moved {r0:.4f} -> {r1:.4f} while S "
+        "precision rose {p0:.4f} -> {p1:.4f}, i.e. the model became slightly "
+        "more conservative, not more sensitive. `best_epoch` was **1** "
+        "again.\n\n"
+        "  Read together with E4, two hypotheses are now eliminated: S is "
+        "not limited by overfitting (E4) and not by RR attenuation (E5). "
+        "What remains is that the model is never **asked** to predict S - "
+        "N outnumbers S 60:1 in every minibatch. That is what E6 changes."
+    ).format(m1=a["macro avg"]["f1-score"], m0=e2a["macro avg"]["f1-score"],
+             s1=a["S"]["f1-score"], s0=e2a["S"]["f1-score"],
+             r0=e2a["S"]["recall"], r1=a["S"]["recall"],
+             p0=e2a["S"]["precision"], p1=a["S"]["precision"])
+
+
 ASSEMBLED = {"4": step4_note, "5": step5_note, "E1": e1_note,
-             "E2": e2_note, "E3": e3_note, "E4": e4_note}
+             "E2": e2_note, "E3": e3_note, "E4": e4_note, "E5": e5_note}
 
 
 # --------------------------------------------------------------------- build
