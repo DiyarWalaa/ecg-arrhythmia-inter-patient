@@ -66,6 +66,33 @@ def _all_positive_ints(v):
 
 CLASSES = ("N", "S", "V")
 
+# WHICH DS2 A ROW WAS SCORED ON
+# -----------------------------
+# Every run through E7 scored the same 49,289-beat DS2. E8 changed the
+# SEGMENTATION rule, and its 2-second span cap rejects beats, so E8 scores
+# 42,154 of them - 6838 fewer N, 271 fewer S, 32 fewer V. Its macro-F1 is
+# therefore not computed over the same population as any earlier row and
+# cannot be differenced against them cell by cell.
+#
+# Rather than relax the support check (which is the only thing standing
+# between the table and a silent apples-to-oranges comparison), each run
+# DECLARES which population it scored. Runs sharing a name must agree
+# exactly; a run whose artefact disagrees with its declared population is
+# refused.
+DS2_POPULATIONS = {
+    "full": {"N": 44233, "S": 1836, "V": 3220},
+    "span_capped_720": {"N": 37400, "S": 1565, "V": 3189},
+}
+
+# step -> population name. Anything absent scores the full DS2.
+DS2_POPULATION_OF = {
+    "E8": "span_capped_720",
+}
+
+
+def population_of(step):
+    return DS2_POPULATION_OF.get(step, "full")
+
 # Tolerance for reconciling a console-printed scalar against the value
 # recomputed from the console-printed confusion matrix. The console prints
 # 4 decimal places, so correct rounding cannot be off by more than 5e-5.
@@ -296,6 +323,27 @@ RUNS = [
                       "S.f1-score": 0.3107, "V.f1-score": 0.8182}},
       "weights": [1.0, 1.4142, 4.0]},
      None),          # assembled from the console log - see e7_note()
+
+    ("E8", "E8_variable_segmentation", "82dd30a",
+     "variable-length R-1..R+1 window, 2 s cap, +mask channel",
+     {"run_name": "E8_variable_segmentation",
+      "config.ds1_val": ["207", "220", "223"],
+      "config.segmentation": "variable_R-1_to_R+1",
+      "config.max_span_samples": 720,
+      "config.input_length": 720,
+      "config.n_input_channels": 10,
+      "config.mask_channel_index": 9,
+      "config.sampler": "balanced_batch",
+      "config.loss": "categorical_crossentropy",
+      "config.oversampling": False,
+      "config.sampling_weights": lambda v: (isinstance(v, list)
+                                            and len(v) == 3
+                                            and all(abs(x - 1.0 / 3) < 1e-9
+                                                    for x in v)),
+      "config.total_parameters": 239331,
+      "segmentation_stats": lambda v: isinstance(v, dict)
+      and set(v) == {"DS1_TRAIN", "DS1_VAL", "DS2"}},
+     None),          # assembled from the artefacts - see e8_note()
 ]
 
 
@@ -437,32 +485,42 @@ def check_console_run(spec, ds2_support):
 
 
 def ds2_support(loaded):
-    """Per-class DS2 support, taken from the archived runs and required equal.
+    """Check every archived run against the DS2 population it declares.
 
-    Every run scores the same untouched DS2. If the artefacts disagree about
-    how many N/S/V beats that is, the console rows have nothing to be checked
-    against and the table is not internally consistent either.
+    Returns the FULL-DS2 support, which is what console rows are checked
+    against. A run that declares a population its artefact does not match
+    is refused, and so is a population whose members disagree with each
+    other - either would mean the table is comparing different test sets
+    without saying so.
     """
+
     seen = {}
+
     for step, folder, _c, _d, _n, m, _h in loaded:
         if folder is None:
             continue
+
         cm = m.get("confusion_matrix") or m["test_argmax"]["confusion_matrix"]
-        sup = tuple(sum(row) for row in cm)
-        seen.setdefault(sup, []).append(step)
-    if len(seen) != 1:
-        raise GateError(
-            "archived runs disagree on DS2 support: %r. This is EXPECTED "
-            "once E8 lands: its variable-length segmentation discards any "
-            "beat whose R-1..R+1 span exceeds 2 s, which removes 6838 N, "
-            "271 S and 32 V from DS2 and leaves 42154 beats against the "
-            "49289 every earlier run scored. E8 is therefore not scored on "
-            "the same test set and its row is not comparable beat for beat. "
-            "Give E8 its own support reference rather than relaxing this "
-            "check - it is the only thing standing between the table and a "
-            "silent apples-to-oranges comparison." % (seen,))
-    sup = next(iter(seen))
-    return dict(zip(CLASSES, sup))
+        sup = dict(zip(CLASSES, (sum(row) for row in cm)))
+
+        name = population_of(step)
+
+        if name not in DS2_POPULATIONS:
+            raise GateError("%s: unknown DS2 population %r" % (step, name))
+
+        if sup != DS2_POPULATIONS[name]:
+            raise GateError(
+                "%s: scored a DS2 of %r but declares population %r, which "
+                "is %r. Either the run is not what the table claims or the "
+                "declaration is stale."
+                % (step, sup, name, DS2_POPULATIONS[name]))
+
+        seen.setdefault(name, []).append(step)
+
+    if "full" not in seen:
+        raise GateError("no archived run scores the full DS2")
+
+    return DS2_POPULATIONS["full"]
 
 
 # -------------------------------------------------------------------- notes
@@ -852,9 +910,77 @@ def e7_note(spec, h, gaps):
              e6t=e6t["macro avg"]["f1-score"])
 
 
+def e8_note(m, h, gaps):
+    """E8 changed the beat population as well as the representation."""
+    a = m["test_argmax"]["classification_report"]
+    t = m["test_tuned"]["classification_report"]
+    cm = m["test_argmax"]["confusion_matrix"]
+    ss = m["segmentation_stats"]
+    e6 = json.load(open(os.path.join(RESULTS, "E6_balanced_sampling",
+                                     "metrics.json")))
+    e6a = e6["test_argmax"]["classification_report"]
+    e6t = e6["test_tuned"]["classification_report"]
+
+    n_e8 = sum(sum(row) for row in cm)
+    n_full = sum(DS2_POPULATIONS["full"].values())
+
+    return (
+        "**NOT COMPARABLE BEAT FOR BEAT WITH ANY ROW ABOVE.** E8 changed "
+        "the segmentation rule, and its 2-second span cap REJECTS beats, so "
+        "it scored **{n8:,} DS2 beats against the {nf:,} every earlier row "
+        "used** - {dn:,} fewer N, {ds} fewer S and {dv} fewer V. Its "
+        "macro-F1 is an average over a different population. The rejection "
+        "is also biased: a long R-1..R+1 span is usually a compensatory "
+        "pause, so the cap preferentially drops post-ectopic beats. Per-"
+        "class acceptance and window-length statistics are in this run's "
+        "`segmentation_stats`.\n\n"
+        "  **S improved a lot and everything else got worse.** S-F1 "
+        "{s0:.4f} -> **{s1:.4f}** and S recall {r0:.4f} -> **{r1:.4f}** "
+        "against E6, the largest movement on S of any run. But macro-F1 "
+        "FELL {m0:.4f} -> {m1:.4f} and accuracy {a0:.4f} -> {a1:.4f}, "
+        "because **V collapsed**: V-F1 {v0:.4f} -> {v1:.4f}, with {nv:,} N "
+        "beats called V. N-F1 fell {n0:.4f} -> {n1:.4f} too.\n\n"
+        "  **Validation got worse, not better**: best val macro-F1 "
+        "{bv:.4f} against E6's 0.5540, selecting epoch {be}. So the run "
+        "that most improved S is also the run validation liked least - the "
+        "3-record validation set does not track this change.\n\n"
+        "  **Threshold tuning transferred again, and it DOWN-weighted S** "
+        "to w = {w}: test macro-F1 {m1:.4f} -> {mt:.4f}. That is the second "
+        "confirmation of the standing rule - the two vectors that ever "
+        "transferred (E6, E8) both leave w_S at or below w_N, and every "
+        "vector that raised it lost.\n\n"
+        "  The window-length statistics say why S moved and why the result "
+        "may not survive a fair comparison. Mean span, N against S: "
+        "DS1_TRAIN {tn:.1f} vs {ts:.1f} (gap {gt:.1f}), DS2 {dn2:.1f} vs "
+        "{ds2:.1f} (gap {gd:.1f}). The prematurity cue E8 adds is far "
+        "weaker in DS2 than in the data it is learned from, so part of the "
+        "S gain is likely the easier population rather than the "
+        "representation. **E9 is the control**: E6's fixed window scored on "
+        "E8's beats."
+    ).format(
+        n8=n_e8, nf=n_full,
+        dn=DS2_POPULATIONS["full"]["N"] - DS2_POPULATIONS["span_capped_720"]["N"],
+        ds=DS2_POPULATIONS["full"]["S"] - DS2_POPULATIONS["span_capped_720"]["S"],
+        dv=DS2_POPULATIONS["full"]["V"] - DS2_POPULATIONS["span_capped_720"]["V"],
+        s0=e6a["S"]["f1-score"], s1=a["S"]["f1-score"],
+        r0=e6a["S"]["recall"], r1=a["S"]["recall"],
+        m0=e6a["macro avg"]["f1-score"], m1=a["macro avg"]["f1-score"],
+        a0=e6["test_argmax"]["accuracy"], a1=m["test_argmax"]["accuracy"],
+        v0=e6a["V"]["f1-score"], v1=a["V"]["f1-score"], nv=cm[0][2],
+        n0=e6a["N"]["f1-score"], n1=a["N"]["f1-score"],
+        bv=m["best_val_macro_f1"], be=m["best_epoch"],
+        w=[round(x, 4) for x in m["threshold_weights"]],
+        mt=t["macro avg"]["f1-score"],
+        tn=ss["DS1_TRAIN"]["N"]["span_mean"], ts=ss["DS1_TRAIN"]["S"]["span_mean"],
+        gt=ss["DS1_TRAIN"]["N"]["span_mean"] - ss["DS1_TRAIN"]["S"]["span_mean"],
+        dn2=ss["DS2"]["N"]["span_mean"], ds2=ss["DS2"]["S"]["span_mean"],
+        gd=ss["DS2"]["N"]["span_mean"] - ss["DS2"]["S"]["span_mean"])
+
+
 ASSEMBLED = {"4": step4_note, "5": step5_note, "6": step6_note,
              "E1": e1_note, "E2": e2_note, "E3": e3_note, "E4": e4_note,
-             "E5": e5_note, "E6": e6_note, "E7": e7_note}
+             "E5": e5_note, "E6": e6_note, "E7": e7_note,
+             "E8": e8_note}
 
 
 # --------------------------------------------------------------------- build
@@ -885,11 +1011,13 @@ def build():
 
         rows.append(
             "| {s} | {d} | `{c}` | {mf1:.4f} | {sr:.4f} | {sp:.4f} | "
-            "{sf:.4f} | {vf:.4f} | {acc:.4f} | {src} |".format(
+            "{sf:.4f} | {vf:.4f} | {acc:.4f} | {src} | {pop} |".format(
                 s=step, d=desc, c=commit,
                 mf1=r["macro avg"]["f1-score"], sr=r["S"]["recall"],
                 sp=r["S"]["precision"], sf=r["S"]["f1-score"],
-                vf=r["V"]["f1-score"], acc=acc, src=source))
+                vf=r["V"]["f1-score"], acc=acc, src=source,
+                pop="full" if population_of(step) == "full"
+                else "**%s**" % population_of(step)))
 
         if folder is None:
             label, entries = m["sweep"]
@@ -979,8 +1107,8 @@ DS2. All metrics below are on DS2 (inter-patient test set).
 > shifts because it is derived from DS1_TRAIN counts. **Steps 5, 6 and E0
 > are not like-for-like comparisons with anything outside that window.**
 
-| step | description | commit | macro-F1 | S recall | S precision | S F1 | V F1 | accuracy | source |
-|---|---|---|---|---|---|---|---|---|---|
+| step | description | commit | macro-F1 | S recall | S precision | S F1 | V F1 | accuracy | source | DS2 |
+|---|---|---|---|---|---|---|---|---|---|---|
 """
 
 GAP_HEADER = """

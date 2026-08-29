@@ -28,24 +28,25 @@ DS2. All metrics below are on DS2 (inter-patient test set).
 > shifts because it is derived from DS1_TRAIN counts. **Steps 5, 6 and E0
 > are not like-for-like comparisons with anything outside that window.**
 
-| step | description | commit | macro-F1 | S recall | S precision | S F1 | V F1 | accuracy | source |
-|---|---|---|---|---|---|---|---|---|---|
-| 0 | colleague's script, paths made configurable | `b58d6b6` | 0.6358 | 0.1171 | 0.3298 | 0.1728 | 0.7694 | 0.9294 | `metrics.json` |
-| 1 | patient-wise validation split (DS1_VAL = 207,220,223) | `ae9a91c` | 0.4569 | 0.0065 | 0.2000 | 0.0127 | 0.4215 | 0.8682 | `metrics.json` |
-| 1b | RR normalization fitted on training set only | `10e06f2` | 0.4742 | 0.0071 | 0.1806 | 0.0136 | 0.4641 | 0.8843 | `metrics.json` |
-| 2 | select on val macro-F1 instead of val_loss | `5c1b9d6` | 0.6800 | 0.1280 | 0.4024 | 0.1942 | 0.8718 | 0.9476 | `metrics.json` |
-| 3 | patient-relative RR ratio features (5 dimensionless) | `1a2509c` | 0.6645 | 0.1514 | 0.3634 | 0.2138 | 0.8004 | 0.9451 | `metrics.json` |
-| 4 | remove oversampling, per-class focal alpha | `3b67016` | 0.5599 | 0.1106 | 0.2016 | 0.1428 | 0.5895 | 0.8892 | `metrics.json` |
-| 5 | enlarge DS1_VAL to 5 records | `7b0236d` | 0.5408 | 0.0708 | 0.1506 | 0.0963 | 0.5745 | 0.8919 | `metrics.json` |
-| 6 | validation-selected focal BETA sweep [0.0, 0.25, 0.41, 0.50] | `25229d9` | 0.5408 | 0.0708 | 0.1506 | 0.0963 | 0.5745 | 0.8919 | **console log** |
-| E0 | re-anchor: step 3 training config, 5-record validation | `042597b` | 0.5591 | 0.0964 | 0.1758 | 0.1245 | 0.6002 | 0.8935 | `metrics.json` |
-| E1 | revert DS1_VAL to 3 records + validation-tuned thresholds | `3d3494b` | 0.6645 | 0.1514 | 0.3634 | 0.2138 | 0.8004 | 0.9451 | `metrics.json` |
-| E2 | 9-scale wavelet scalogram input (linear 10-90 Hz) | `11cd348` | 0.7178 | 0.1972 | 0.4214 | 0.2686 | 0.9111 | 0.9503 | `metrics.json` |
-| E3 | log-spaced wavelet scales 3-90 Hz | `fe14c34` | 0.6151 | 0.1013 | 0.2875 | 0.1498 | 0.7321 | 0.9270 | `metrics.json` |
-| E4 | revert to E2 scales, capacity 239,171 -> 16,283 | `cb9224e` | 0.5602 | 0.0000 | 0.0000 | 0.0000 | 0.7133 | 0.9309 | `metrics.json` |
-| E5 | E2 architecture + direct RR skip to the output layer | `986dc29` | 0.7012 | 0.1574 | 0.4419 | 0.2321 | 0.8982 | 0.9498 | `metrics.json` |
-| E6 | balanced batch sampling (1:1:1) + plain cross-entropy | `5b3b203` | 0.7263 | 0.3388 | 0.3934 | 0.3641 | 0.8503 | 0.9352 | `metrics.json` |
-| E7 | sampler S:N ratio sweep [1, 2, 3, 4] | `1339261` | 0.7114 | 0.3393 | 0.2789 | 0.3061 | 0.8685 | 0.9261 | **console log** |
+| step | description | commit | macro-F1 | S recall | S precision | S F1 | V F1 | accuracy | source | DS2 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | colleague's script, paths made configurable | `b58d6b6` | 0.6358 | 0.1171 | 0.3298 | 0.1728 | 0.7694 | 0.9294 | `metrics.json` | full |
+| 1 | patient-wise validation split (DS1_VAL = 207,220,223) | `ae9a91c` | 0.4569 | 0.0065 | 0.2000 | 0.0127 | 0.4215 | 0.8682 | `metrics.json` | full |
+| 1b | RR normalization fitted on training set only | `10e06f2` | 0.4742 | 0.0071 | 0.1806 | 0.0136 | 0.4641 | 0.8843 | `metrics.json` | full |
+| 2 | select on val macro-F1 instead of val_loss | `5c1b9d6` | 0.6800 | 0.1280 | 0.4024 | 0.1942 | 0.8718 | 0.9476 | `metrics.json` | full |
+| 3 | patient-relative RR ratio features (5 dimensionless) | `1a2509c` | 0.6645 | 0.1514 | 0.3634 | 0.2138 | 0.8004 | 0.9451 | `metrics.json` | full |
+| 4 | remove oversampling, per-class focal alpha | `3b67016` | 0.5599 | 0.1106 | 0.2016 | 0.1428 | 0.5895 | 0.8892 | `metrics.json` | full |
+| 5 | enlarge DS1_VAL to 5 records | `7b0236d` | 0.5408 | 0.0708 | 0.1506 | 0.0963 | 0.5745 | 0.8919 | `metrics.json` | full |
+| 6 | validation-selected focal BETA sweep [0.0, 0.25, 0.41, 0.50] | `25229d9` | 0.5408 | 0.0708 | 0.1506 | 0.0963 | 0.5745 | 0.8919 | **console log** | full |
+| E0 | re-anchor: step 3 training config, 5-record validation | `042597b` | 0.5591 | 0.0964 | 0.1758 | 0.1245 | 0.6002 | 0.8935 | `metrics.json` | full |
+| E1 | revert DS1_VAL to 3 records + validation-tuned thresholds | `3d3494b` | 0.6645 | 0.1514 | 0.3634 | 0.2138 | 0.8004 | 0.9451 | `metrics.json` | full |
+| E2 | 9-scale wavelet scalogram input (linear 10-90 Hz) | `11cd348` | 0.7178 | 0.1972 | 0.4214 | 0.2686 | 0.9111 | 0.9503 | `metrics.json` | full |
+| E3 | log-spaced wavelet scales 3-90 Hz | `fe14c34` | 0.6151 | 0.1013 | 0.2875 | 0.1498 | 0.7321 | 0.9270 | `metrics.json` | full |
+| E4 | revert to E2 scales, capacity 239,171 -> 16,283 | `cb9224e` | 0.5602 | 0.0000 | 0.0000 | 0.0000 | 0.7133 | 0.9309 | `metrics.json` | full |
+| E5 | E2 architecture + direct RR skip to the output layer | `986dc29` | 0.7012 | 0.1574 | 0.4419 | 0.2321 | 0.8982 | 0.9498 | `metrics.json` | full |
+| E6 | balanced batch sampling (1:1:1) + plain cross-entropy | `5b3b203` | 0.7263 | 0.3388 | 0.3934 | 0.3641 | 0.8503 | 0.9352 | `metrics.json` | full |
+| E7 | sampler S:N ratio sweep [1, 2, 3, 4] | `1339261` | 0.7114 | 0.3393 | 0.2789 | 0.3061 | 0.8685 | 0.9261 | **console log** | full |
+| E8 | variable-length R-1..R+1 window, 2 s cap, +mask channel | `82dd30a` | 0.6495 | 0.6594 | 0.3715 | 0.4752 | 0.5661 | 0.8410 | `metrics.json` | **span_capped_720** |
 
 ## Notes
 
@@ -157,6 +158,17 @@ DS2. All metrics below are on DS2 (inter-patient test set).
 
   Threshold tuning did not transfer either: w = [1.0, 1.4142, 4.0] took test macro-F1 0.7114 -> 0.6944 and accuracy 0.9261 -> 0.9170, after it had transferred at E6. **E6 remains the best run**, at macro-F1 0.7263 argmax / 0.7372 tuned.
 
+- **step E8** (`E8_variable_segmentation`) - train distribution N=35025 / S=637 / V=2878. Ran 15 epochs; selection on `val_macro_f1` chose **epoch 5** (best val macro-F1 0.5090); early stopping fired: True.
+  **NOT COMPARABLE BEAT FOR BEAT WITH ANY ROW ABOVE.** E8 changed the segmentation rule, and its 2-second span cap REJECTS beats, so it scored **42,154 DS2 beats against the 49,289 every earlier row used** - 6,833 fewer N, 271 fewer S and 31 fewer V. Its macro-F1 is an average over a different population. The rejection is also biased: a long R-1..R+1 span is usually a compensatory pause, so the cap preferentially drops post-ectopic beats. Per-class acceptance and window-length statistics are in this run's `segmentation_stats`.
+
+  **S improved a lot and everything else got worse.** S-F1 0.3641 -> **0.4752** and S recall 0.3388 -> **0.6594** against E6, the largest movement on S of any run. But macro-F1 FELL 0.7263 -> 0.6495 and accuracy 0.9352 -> 0.8410, because **V collapsed**: V-F1 0.8503 -> 0.5661, with 4,405 N beats called V. N-F1 fell 0.9646 -> 0.9072 too.
+
+  **Validation got worse, not better**: best val macro-F1 0.5090 against E6's 0.5540, selecting epoch 5. So the run that most improved S is also the run validation liked least - the 3-record validation set does not track this change.
+
+  **Threshold tuning transferred again, and it DOWN-weighted S** to w = [1.0, 0.25, 0.3536]: test macro-F1 0.6495 -> 0.6706. That is the second confirmation of the standing rule - the two vectors that ever transferred (E6, E8) both leave w_S at or below w_N, and every vector that raised it lost.
+
+  The window-length statistics say why S moved and why the result may not survive a fair comparison. Mean span, N against S: DS1_TRAIN 520.4 vs 407.3 (gap 113.1), DS2 524.0 vs 506.4 (gap 17.6). The prematurity cue E8 adds is far weaker in DS2 than in the data it is learned from, so part of the S gain is likely the easier population rather than the representation. **E9 is the control**: E6's fixed window scored on E8's beats.
+
 ## Test-minus-validation gap
 
 A model selected on a trustworthy validation signal should not score wildly
@@ -177,6 +189,7 @@ differently on test. The gap is `test macro-F1 - best_val_macro_f1`:
 | E5 | 0.5620 | 0.7012 | +0.1392 | `metrics.json` |
 | E6 | 0.5540 | 0.7263 | +0.1723 | `metrics.json` |
 | E7 | 0.5620 | 0.7114 | +0.1494 | **console log** |
+| E8 | 0.5090 | 0.6495 | +0.1405 | `metrics.json` |
 
 Steps 2 and 3 scored **above** validation, which is the expected direction
 when validation holds only three patients and two of them are hard. Step 4 is
