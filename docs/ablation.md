@@ -228,3 +228,36 @@ Taken together, step 6 and E7 rule out the two obvious knobs - reweighting
 the loss and reweighting the sampler. Both are dead ends on S recall, and
 both were established at a **cost**: they are the two rows in this table with
 no archived artefact.
+
+## Pre-registered, NOT YET RUN
+
+**E8 - variable-length segmentation, R-1 to R+1.** Written and verified, but
+it has no row above and no `results/` folder because it has not been trained
+yet. Recorded here before the fact so the comparison cannot be reframed
+afterwards.
+
+E8 replaces the fixed 234-sample window with the full span between the
+neighbouring R peaks, capped at 2 seconds, zero-padded to 720 and carrying a
+binary real/padding mask as a 10th channel. The point is that the window
+LENGTH becomes a feature: an S beat is premature, so its span is shorter.
+
+**E8 will NOT be a clean one-variable ablation, and its row must not be read
+as one.** The 2-second cap discards beats, and it discards them unevenly,
+because a long span is usually a compensatory pause - the post-ectopic
+population. Measured on the real records before running:
+
+| split | N accepted | S accepted | V accepted | S dropped |
+|---|---|---|---|---|
+| DS1_TRAIN | 35025 (-13.1%) | 637 (-4.9%) | 2878 (-7.3%) | 33 |
+| DS1_VAL | 5361 (-3.2%) | 273 (0.0%) | 602 (-11.9%) | 0 |
+| DS2 | 37400 (-15.5%) | 1565 (-14.8%) | 3189 (-1.0%) | 271 |
+
+**DS2 shrinks from 49,289 beats to 42,154, losing 271 of 1836 true S beats.**
+Every macro-F1 above was computed over the full DS2; E8's will not be. Its
+confusion matrix is a different shape of problem and cannot be differenced
+against E6's cell by cell.
+
+The mechanism is also weaker on test than on train. Mean span, N against S:
+DS1_TRAIN 520.4 against 407.3 samples, a 113-sample gap; DS2 524.0 against
+506.4, a gap of 17.6. The prematurity signal E8 adds is roughly six times
+weaker in DS2 than in the data the model learns it from.
