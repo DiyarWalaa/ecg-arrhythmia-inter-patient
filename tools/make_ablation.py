@@ -82,11 +82,16 @@ CLASSES = ("N", "S", "V")
 DS2_POPULATIONS = {
     "full": {"N": 44233, "S": 1836, "V": 3220},
     "span_capped_720": {"N": 37400, "S": 1565, "V": 3189},
+    # E9 applies E8's span cap but keeps E6's fixed 234-sample window, so
+    # it additionally loses the 12 first-of-record beats whose r-90 window
+    # starts before sample 0 - 6 of them in DS2 (5 N, 1 V, no S).
+    "span_capped_720_fixed_window": {"N": 37395, "S": 1565, "V": 3188},
 }
 
 # step -> population name. Anything absent scores the full DS2.
 DS2_POPULATION_OF = {
     "E8": "span_capped_720",
+    "E9": "span_capped_720_fixed_window",
 }
 
 
@@ -1176,36 +1181,46 @@ no archived artefact.
 
 ## Pre-registered, NOT YET RUN
 
-**E8 - variable-length segmentation, R-1 to R+1.** Written and verified, but
-it has no row above and no `results/` folder because it has not been trained
-yet. Recorded here before the fact so the comparison cannot be reframed
-afterwards.
+**E9 - E6's window on E8's beat population.** Written and verified against
+the real records, but not trained: no row above and no `results/` folder.
 
-E8 replaces the fixed 234-sample window with the full span between the
-neighbouring R peaks, capped at 2 seconds, zero-padded to 720 and carrying a
-binary real/padding mask as a 10th channel. The point is that the window
-LENGTH becomes a feature: an S beat is premature, so its span is shorter.
+E8 is the best run on S by a wide margin and one of the worse runs overall,
+and it changed TWO things at once - the representation and the beat
+population. E9 holds the representation at E6's (fixed 234-sample window, 9
+wavelet channels, no mask, 239,171 parameters, sampler 1:1:1, plain
+cross-entropy) and borrows only E8's ACCEPTANCE RULE: keep a beat if the
+span between its neighbouring R peaks is at most 720 samples.
 
-**E8 will NOT be a clean one-variable ablation, and its row must not be read
-as one.** The 2-second cap discards beats, and it discards them unevenly,
-because a long span is usually a compensatory pause - the post-ectopic
-population. Measured on the real records before running:
+Verified on all 44 records before running - the span-cap rejections
+reproduce E8's exactly (DS1_TRAIN 5280/33/227, DS1_VAL 179/0/81, DS2
+6838/271/32):
 
-| split | N accepted | S accepted | V accepted | S dropped |
-|---|---|---|---|---|
-| DS1_TRAIN | 35025 (-13.1%) | 637 (-4.9%) | 2878 (-7.3%) | 33 |
-| DS1_VAL | 5361 (-3.2%) | 273 (0.0%) | 602 (-11.9%) | 0 |
-| DS2 | 37400 (-15.5%) | 1565 (-14.8%) | 3189 (-1.0%) | 271 |
+| split | E9 accepted | E8 accepted | difference |
+|---|---|---|---|
+| DS1_TRAIN | 35021 / 637 / 2878 | 35025 / 637 / 2878 | -4 N |
+| DS1_VAL | 5359 / 273 / 602 | 5361 / 273 / 602 | -2 N |
+| DS2 | 37395 / 1565 / 3188 | 37400 / 1565 / 3189 | -5 N, -1 V |
 
-**DS2 shrinks from 49,289 beats to 42,154, losing 271 of 1836 true S beats.**
-Every macro-F1 above was computed over the full DS2; E8's will not be. Its
-confusion matrix is a different shape of problem and cannot be differenced
-against E6's cell by cell.
+**E9 is scored on 42,148 DS2 beats against E8's 42,154.** The 6 excluded
+beats are 5 N and 1 V, every one the first annotated beat of its record,
+where the R peak sits 28-88 samples in so E6's `r - 90` window starts before
+sample 0 and there is no signal to read. E8's `R-1..R+1` window did not have
+that problem. **The S class is identical on both sides at 1,565 beats**, so
+every S metric is exactly comparable; N recall can move by at most 1.3e-4
+and V recall by at most 3.1e-4, bounding macro-F1 incomparability below
+2e-4 against an E8-vs-E6 effect size of 0.08 - roughly 400x smaller than
+what is being measured. Stated so the comparison is precise rather than
+approximate.
 
-The mechanism is also weaker on test than on train. Mean span, N against S:
-DS1_TRAIN 520.4 against 407.3 samples, a 113-sample gap; DS2 524.0 against
-506.4, a gap of 17.6. The prematurity signal E8 adds is roughly six times
-weaker in DS2 than in the data the model learns it from.
+Re-running E8 with the fixed-window edge rule would spend a full run
+removing an uncertainty 400x below the effect; left-padding the window at
+the record start would fabricate a signal pattern the model sees nowhere
+else. Both are worse than the 6-beat gap.
+
+**What E9 decides.** If it recovers most of E8's S gain (S-F1 0.4752, S
+recall 0.6594 against E6's 0.3641 and 0.3388), the gain was the easier
+population and the variable-length representation is not doing the work. If
+it stays near E6, the representation is.
 """
 
 

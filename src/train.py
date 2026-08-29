@@ -231,11 +231,6 @@ assert set(DS1_VAL).issubset(set(DS1)), "DS1_VAL must be a subset of DS1"
 assert not set(DS1_VAL) & set(DS2), "DS1_VAL must never contain a DS2 record"
 assert len(DS1_TRAIN) + len(DS1_VAL) == len(DS1)
 
-# E6 and earlier used a FIXED window of PRE_SAMPLES before and
-# POST_SAMPLES after the R peak. E8 replaces that with a variable-length
-# window (section 7), but the two constants stay defined: they are written
-# into metrics.json so an E8 run remains comparable with everything before
-# it, and SEGMENT_LENGTH is the length every run up to E7 used.
 PRE_SAMPLES = 90
 POST_SAMPLES = 144
 
@@ -259,29 +254,23 @@ SEGMENT_LENGTH = PRE_SAMPLES + POST_SAMPLES
 # hardcoded - see section 6B.
 SAMPLING_RATE_HZ = 360.0
 
-# E8: VARIABLE-LENGTH SEGMENTATION, R-1 TO R+1.
+# E9: E6's WINDOW, E8's BEAT POPULATION.
 #
-# E6 fires S at nearly the right frequency - 1581 predictions against 1836
-# true S beats - but only 622 are correct, and E7 showed the sampler is
-# saturated. What is left is discriminability.
+# E8 reached S-F1 0.4752 and S recall 0.6594 against E6's 0.3641 and
+# 0.3388 - but on a different test set. Its 2-second span cap rejected
+# 15.5% of N, 14.8% of S and 1.0% of V, so DS2 fell from 49,289 beats to
+# 42,154. The gain cannot be attributed to the representation until both
+# are scored on the same beats.
 #
-# De Waele et al. (2026), on this same DS1/DS2 split, reach S sensitivity
-# 0.9116 against our 0.3442. Their window runs from the PREVIOUS R peak to
-# the NEXT R peak and they discard spans over 2 seconds. That makes the
-# window LENGTH itself a feature: an S beat is premature, so its span is
-# physically shorter. Our fixed 234-sample window threw that away - every
-# beat looked the same length no matter how early it arrived.
+# E9 is the control. The model still sees E6's FIXED 234-sample window at
+# 9 wavelet channels and 239,171 parameters - PRE_SAMPLES/POST_SAMPLES are
+# untouched, there is no mask channel and no padding. The only thing
+# borrowed from E8 is its ACCEPTANCE RULE: a beat is kept only if the span
+# between its neighbouring R peaks is at most MAX_SPAN_SAMPLES.
 #
-# The cap is 2 seconds, as theirs is. It is not free: a long span is
-# usually a compensatory pause, so the cap preferentially drops
-# POST-ECTOPIC beats. That rejection bias is measured per class and per
-# split in section 7 and written into metrics.json - see
-# SEGMENTATION_STATS. It also means the class counts differ from every
-# previous run, so E8 is NOT a clean one-variable ablation.
+# If E9 recovers most of E8's S gain, the gain was the easier population.
+# If it does not, the gain was the representation.
 MAX_SPAN_SAMPLES = int(2.0 * SAMPLING_RATE_HZ)
-
-# Every beat is padded on the RIGHT to this length.
-INPUT_LENGTH = MAX_SPAN_SAMPLES
 
 WAVELET_TARGET_FREQS_HZ = [float(10 * k) for k in range(1, 10)]
 
@@ -529,15 +518,6 @@ WAVELET_CENTRE_FREQS_HZ = [
 
 N_WAVELET_SCALES = len(WAVELET_WIDTHS)
 
-# E8 appends ONE extra channel to the scalogram: a binary mask, 1.0 on
-# real samples and 0.0 on padding. Zero in scalogram space already means
-# "no wavelet energy", which is the natural encoding of absence, but the
-# mask makes the boundary explicit rather than something the first Conv1D
-# has to infer. It is the last channel.
-MASK_CHANNEL_INDEX = N_WAVELET_SCALES
-
-N_INPUT_CHANNELS = N_WAVELET_SCALES + 1
-
 print(f"\nWavelet scalogram: {N_WAVELET_SCALES} Ricker scales "
       f"at fs = {SAMPLING_RATE_HZ:.0f} Hz")
 print(f"  {'target Hz':>10} {'width a':>10} {'centre Hz':>10} "
@@ -546,7 +526,7 @@ print(f"  {'target Hz':>10} {'width a':>10} {'centre Hz':>10} "
 for _f, _a, _c in zip(WAVELET_TARGET_FREQS_HZ, WAVELET_WIDTHS,
                       WAVELET_CENTRE_FREQS_HZ):
     print(f"  {_f:>10.1f} {_a:>10.4f} {_c:>10.4f} "
-          f"{int(min(10.0 * _a, MAX_SPAN_SAMPLES)):>8}")
+          f"{int(min(10.0 * _a, SEGMENT_LENGTH)):>8}")
 
 
 # =========================================================
@@ -556,10 +536,11 @@ for _f, _a, _c in zip(WAVELET_TARGET_FREQS_HZ, WAVELET_WIDTHS,
 def empty_segmentation_stats():
     """Zeroed per-class accounting for one record or one split.
 
-    `accepted` plus the three rejection buckets is every annotated beat
-    whose symbol is in AAMI_MAP, so the four always reconcile against the
-    total. `spans` holds the accepted window lengths in samples, which is
-    what the mean/std per class is computed from.
+    `accepted` plus the four rejection buckets is every annotated beat
+    whose symbol is in AAMI_MAP, so they always reconcile against the
+    total. `spans` holds the accepted R-1..R+1 span lengths, which is what
+    the per-class mean and standard deviation are computed from - the
+    window the MODEL sees is a fixed SEGMENT_LENGTH regardless.
     """
 
     labels = sorted(set(AAMI_MAP.values()))
@@ -569,6 +550,7 @@ def empty_segmentation_stats():
         "rejected_max_span": {lab: 0 for lab in labels},
         "rejected_edge": {lab: 0 for lab in labels},
         "rejected_invalid_span": {lab: 0 for lab in labels},
+        "rejected_fixed_window": {lab: 0 for lab in labels},
         "spans": {lab: [] for lab in labels}
     }
 
@@ -577,7 +559,7 @@ def merge_segmentation_stats(into, other):
     """Accumulate one record's stats into a running total."""
 
     for key in ("accepted", "rejected_max_span", "rejected_edge",
-                "rejected_invalid_span"):
+                "rejected_invalid_span", "rejected_fixed_window"):
         for lab, count in other[key].items():
             into[key][lab] += count
 
@@ -588,14 +570,7 @@ def merge_segmentation_stats(into, other):
 
 
 def summarize_segmentation_stats(stats):
-    """Turn raw stats into the JSON-serialisable block metrics.json gets.
-
-    Reports, per class: how many beats were accepted, how many were
-    rejected for each reason, and the mean and standard deviation of the
-    accepted window length. The window-length statistics are the whole
-    point of E8 - if S spans are not shorter than N spans, the change
-    cannot work.
-    """
+    """Turn raw stats into the JSON-serialisable block metrics.json gets."""
 
     out = {}
 
@@ -608,6 +583,7 @@ def summarize_segmentation_stats(stats):
             "rejected_max_span": int(stats["rejected_max_span"][lab]),
             "rejected_edge": int(stats["rejected_edge"][lab]),
             "rejected_invalid_span": int(stats["rejected_invalid_span"][lab]),
+            "rejected_fixed_window": int(stats["rejected_fixed_window"][lab]),
             "span_mean": float(spans.mean()) if spans.size else None,
             "span_std": float(spans.std()) if spans.size else None,
             "span_min": int(spans.min()) if spans.size else None,
@@ -617,7 +593,8 @@ def summarize_segmentation_stats(stats):
         total = (out[lab]["accepted"]
                  + out[lab]["rejected_max_span"]
                  + out[lab]["rejected_edge"]
-                 + out[lab]["rejected_invalid_span"])
+                 + out[lab]["rejected_invalid_span"]
+                 + out[lab]["rejected_fixed_window"])
 
         out[lab]["total_annotated"] = int(total)
 
@@ -631,14 +608,16 @@ def summarize_segmentation_stats(stats):
 def extract_beats_from_record(
     record_name,
     data_dir,
+    pre_samples,
+    post_samples,
     lead_index=0
 ):
-    """Variable-length beats, R-1 to R+1, as a padded masked scalogram.
+    """E6's fixed window, restricted to E8's beat population.
 
     Returns (beats, labels, rr_features, raw_beats, stats). Each beat is
-    (INPUT_LENGTH, N_INPUT_CHANNELS) float32: the first N_WAVELET_SCALES
-    channels are the Ricker scalogram of the REAL span, zero-padded on the
-    right, and the last channel is the binary real/padding mask.
+    (SEGMENT_LENGTH, N_WAVELET_SCALES) - exactly what E6 produced. The
+    R-1..R+1 span is computed only to decide ACCEPTANCE; it never reaches
+    the model.
     """
 
     record_path = os.path.join(
@@ -683,14 +662,15 @@ def extract_beats_from_record(
     labels = []
     rr_features = []
 
-    # E6 removed augmentation, and E8's beats are variable length, so a
-    # rectangular array of raw waveforms can no longer be built at all.
-    # The only consumer was augment_training_data(), which is uncalled -
-    # see the guard at the top of it. Kept in the signature so the tuple
-    # shape downstream is unchanged.
+    # The z-scored raw waveform is kept alongside the scalogram so that
+    # augmentation can perturb the WAVEFORM and then re-enter the exact
+    # same normalize -> CWT tail the originals went through. Augmentation
+    # remains UNCALLED - class balance comes from the sampler.
     raw_beats = []
 
     for i in range(1, len(ann_samples) - 1):
+
+        r_peak = ann_samples[i]
 
         symbol = ann_symbols[i]
 
@@ -699,32 +679,47 @@ def extract_beats_from_record(
 
         label = AAMI_MAP[symbol]
 
-        # E8: the window is the full span between the neighbouring R
-        # peaks, so its LENGTH carries the prematurity signal.
-        start = int(ann_samples[i - 1])
-        end = int(ann_samples[i + 1])
+        # --- E8's ACCEPTANCE RULE, applied first and identically --------
+        #
+        # This is the only thing E9 borrows from E8. It decides which
+        # beats exist; it does not change what the model sees.
+        span_start = int(ann_samples[i - 1])
+        span_end = int(ann_samples[i + 1])
 
-        if start < 0 or end > len(signal):
+        if span_start < 0 or span_end > len(signal):
             stats["rejected_edge"][label] += 1
             continue
 
-        span = end - start
+        span = span_end - span_start
 
-        # Duplicate or non-monotonic annotations would give a zero or
-        # negative span; z-scoring an empty slice yields NaN, so these are
-        # dropped and counted rather than silently poisoning a batch.
         if span <= 0:
             stats["rejected_invalid_span"][label] += 1
             continue
 
-        # The 2-second cap, as in de Waele et al. This is the biased
-        # rejection: a long span is usually a compensatory pause, so this
-        # drops post-ectopic beats preferentially.
         if span > MAX_SPAN_SAMPLES:
             stats["rejected_max_span"][label] += 1
             continue
 
+        # --- E6's FIXED WINDOW, unchanged -------------------------------
+        start = r_peak - pre_samples
+        end = r_peak + post_samples
+
+        # E8's window was R-1..R+1, which is in bounds wherever the span
+        # rule above passed. The fixed window is not: 12 beats across the
+        # database are the FIRST annotated beat of their record, with the
+        # R peak 28-88 samples in, so r - pre_samples < 0 and there is no
+        # signal to read. Those 12 (4 N in DS1_TRAIN, 2 N in DS1_VAL,
+        # 5 N + 1 V in DS2, and no S anywhere) are in E8's population and
+        # cannot be in E9's. Counted separately so the gap is explicit.
+        if start < 0 or end > len(signal):
+            stats["rejected_fixed_window"][label] += 1
+            continue
+
         segment = signal[start:end]
+
+        if len(segment) != SEGMENT_LENGTH:
+            stats["rejected_fixed_window"][label] += 1
+            continue
 
         pre_rr = float(rr_series[i - 1])
         post_rr = float(rr_series[i])
@@ -761,31 +756,17 @@ def extract_beats_from_record(
             for value in rr
         ]
 
-        # Z-score the REAL portion only. Padding is appended afterwards,
-        # so it never enters the mean or the standard deviation.
         segment = normalize_segment(segment)
 
-        # CWT on the REAL portion only, at the unchanged 9 linear
-        # 10-90 Hz scales. Padding BEFORE the transform would put a step
-        # discontinuity at the boundary, and a step is exactly what a
-        # Ricker wavelet responds to most strongly - the edge artifact
-        # would dominate the scalogram.
-        scalogram = cwt_ricker(
+        raw_beats.append(segment.astype(np.float32))
+
+        # (SEGMENT_LENGTH,) -> (SEGMENT_LENGTH, N_WAVELET_SCALES)
+        segment = cwt_ricker(
             segment,
             WAVELET_WIDTHS
         ).T.astype(np.float32)
 
-        # Zero-pad on the RIGHT to (INPUT_LENGTH, N_WAVELET_SCALES), then
-        # append the mask as the last channel.
-        padded = np.zeros(
-            (INPUT_LENGTH, N_INPUT_CHANNELS),
-            dtype=np.float32
-        )
-
-        padded[:span, :N_WAVELET_SCALES] = scalogram
-        padded[:span, MASK_CHANNEL_INDEX] = 1.0
-
-        beats.append(padded)
+        beats.append(segment)
 
         labels.append(label)
 
@@ -804,14 +785,10 @@ def extract_beats_from_record(
 def load_dataset(
     record_list,
     data_dir,
+    pre_samples,
+    post_samples,
     lead_index=0
 ):
-    """Load a list of records into arrays, accumulating rejection stats.
-
-    Returns (X, y, RR, X_raw, stats). X is
-    (n, INPUT_LENGTH, N_INPUT_CHANNELS) float32. X_raw is an empty array -
-    see the note in extract_beats_from_record.
-    """
 
     all_beats = []
     all_labels = []
@@ -827,8 +804,12 @@ def load_dataset(
         beats, labels, rr, raw, rec_stats = extract_beats_from_record(
             rec,
             data_dir,
+            pre_samples,
+            post_samples,
             lead_index
         )
+
+        merge_segmentation_stats(stats, rec_stats)
 
         all_beats.extend(beats)
 
@@ -838,20 +819,10 @@ def load_dataset(
 
         all_raw.extend(raw)
 
-        merge_segmentation_stats(stats, rec_stats)
-
-    # Preallocating and filling avoids building a second full-size copy,
-    # which np.array(list_of_arrays) would do. At (720, 10) float32 a
-    # DS1_TRAIN-sized copy is over a gigabyte.
-    X = np.empty(
-        (len(all_beats), INPUT_LENGTH, N_INPUT_CHANNELS),
+    X = np.array(
+        all_beats,
         dtype=np.float32
     )
-
-    for _i, _beat in enumerate(all_beats):
-        X[_i] = _beat
-
-    all_beats.clear()
 
     y = np.array(all_labels)
 
@@ -944,25 +915,12 @@ def augment_training_data(
              originals, already produced by normalize -> CWT in section 7.
     X_raw  - (n, SEGMENT_LENGTH) z-scored waveforms for the same beats.
 
-    UNCALLABLE SINCE E8. Beats are variable length now, so load_dataset
-    returns an empty X_raw and there is no rectangular waveform array to
-    perturb. The function is left in place for history; calling it raises
-    rather than silently augmenting from an empty array.
-
     Augmentation perturbs the WAVEFORM and then runs the identical
     normalize -> CWT tail the originals went through, so every sample the
     model sees - original or synthetic, train or test - reaches the
     network by the same route. Perturbing the scalogram instead put 85.7%
     of S training samples on a different scale from every test beat.
     """
-
-    raise NotImplementedError(
-        "augment_training_data() is incompatible with E8 variable-length "
-        "segmentation: load_dataset() no longer returns a rectangular "
-        "X_raw, so there is nothing to perturb. Class balance comes from "
-        "the sampler in section 19B. Hard constraint 2 forbids data "
-        "expansion anyway - this path has been uncalled since E6."
-    )
 
     X_list = [X]
     RR_list = [RR]
@@ -1203,6 +1161,8 @@ print("Loading DS1_TRAIN (train) ...")
 X_train, y_train, RR_train, X_raw_train, SEG_STATS_TRAIN = load_dataset(
     DS1_TRAIN,
     DATA_DIR,
+    PRE_SAMPLES,
+    POST_SAMPLES,
     LEAD_INDEX
 )
 
@@ -1225,6 +1185,8 @@ for rec in DS1_VAL:
     X_rec, y_rec, RR_rec, _, _rec_stats = load_dataset(
         [rec],
         DATA_DIR,
+        PRE_SAMPLES,
+        POST_SAMPLES,
         LEAD_INDEX
     )
 
@@ -1247,6 +1209,8 @@ print("\nLoading DS2 (test) ...")
 X_test, y_test, RR_test, _, SEG_STATS_TEST = load_dataset(
     DS2,
     DATA_DIR,
+    PRE_SAMPLES,
+    POST_SAMPLES,
     LEAD_INDEX
 )
 
@@ -1266,12 +1230,17 @@ print("\nOriginal Test Distribution:")
 print(Counter(y_test))
 
 
-# --- E8 segmentation accounting -----------------------------------------
+# --- E9 population accounting -------------------------------------------
 #
-# The 2-second cap drops beats, and it does not drop them uniformly: a
-# long span is usually a compensatory pause, which is the post-ectopic
-# population. Report it per class and per split rather than letting the
-# class counts quietly change.
+# E9 exists to score E6's representation on E8's beats, so the population
+# has to be shown, not asserted in a commit message.
+#
+# `rejected_max_span` is E8's 2-second cap, reproduced exactly.
+# `rejected_fixed_window` is the residual E9 cannot avoid: 12 beats across
+# the database are the first annotated beat of their record, with the R
+# peak 28-88 samples in, so E6's r-90 window starts before sample 0. E8's
+# R-1..R+1 window did not, so E8 has them and E9 cannot. None is an S
+# beat.
 
 SEGMENTATION_STATS = {
     "DS1_TRAIN": summarize_segmentation_stats(SEG_STATS_TRAIN),
@@ -1279,30 +1248,62 @@ SEGMENTATION_STATS = {
     "DS2": summarize_segmentation_stats(SEG_STATS_TEST)
 }
 
-print("\n" + "=" * 72)
-print("E8 SEGMENTATION: acceptance and rejection by class and split")
-print(f"  window = R[i-1] .. R[i+1], cap {MAX_SPAN_SAMPLES} samples "
-      f"({MAX_SPAN_SAMPLES / SAMPLING_RATE_HZ:.1f} s), "
-      f"padded right to {INPUT_LENGTH} with a mask channel")
-print("=" * 72)
-print(f"  {'split':<10} {'cls':>3} {'annot':>7} {'accept':>7} "
-      f"{'>cap':>6} {'edge':>5} {'bad':>4} {'rej%':>6} "
-      f"{'span mean':>10} {'span std':>9} {'min':>5} {'max':>5}")
+# The population E8 reached, from results/E8_variable_segmentation.
+E8_ACCEPTED = {
+    "DS1_TRAIN": {"N": 35025, "S": 637, "V": 2878},
+    "DS1_VAL": {"N": 5361, "S": 273, "V": 602},
+    "DS2": {"N": 37400, "S": 1565, "V": 3189}
+}
+
+# What E9 must reach: E8's population minus the 12 unreachable beats.
+E9_EXPECTED = {
+    "DS1_TRAIN": {"N": 35021, "S": 637, "V": 2878},
+    "DS1_VAL": {"N": 5359, "S": 273, "V": 602},
+    "DS2": {"N": 37395, "S": 1565, "V": 3188}
+}
+
+print("\n" + "=" * 78)
+print("E9 POPULATION: E6's fixed window, E8's acceptance rule")
+print(f"  model sees a FIXED {SEGMENT_LENGTH}-sample window at "
+      f"{N_WAVELET_SCALES} wavelet channels; the R-1..R+1 span "
+      f"(cap {MAX_SPAN_SAMPLES}) only decides inclusion")
+print("=" * 78)
+print(f"  {'split':<10} {'cls':>3} {'annot':>7} {'accept':>7} {'E8':>7} "
+      f"{'diff':>5} {'>cap':>6} {'fixwin':>7} {'edge':>5} "
+      f"{'span mean':>10} {'span std':>9}")
 
 for _split, _block in SEGMENTATION_STATS.items():
     for _lab, _row in _block.items():
         _mean = _row["span_mean"]
         _std = _row["span_std"]
+        _e8 = E8_ACCEPTED[_split][_lab]
         print(f"  {_split:<10} {_lab:>3} {_row['total_annotated']:>7} "
-              f"{_row['accepted']:>7} {_row['rejected_max_span']:>6} "
+              f"{_row['accepted']:>7} {_e8:>7} "
+              f"{_row['accepted'] - _e8:>5} "
+              f"{_row['rejected_max_span']:>6} "
+              f"{_row['rejected_fixed_window']:>7} "
               f"{_row['rejected_edge']:>5} "
-              f"{_row['rejected_invalid_span']:>4} "
-              f"{100.0 * _row['rejection_rate']:>5.2f}% "
               f"{_mean if _mean is None else round(_mean, 1):>10} "
-              f"{_std if _std is None else round(_std, 1):>9} "
-              f"{str(_row['span_min']):>5} {str(_row['span_max']):>5}")
+              f"{_std if _std is None else round(_std, 1):>9}")
 
-# The accepted counts must be exactly what landed in the arrays.
+# Hard stop if the population is not the one E9 is defined to score. A
+# silent mismatch here would make the whole comparison meaningless.
+_pop_errors = []
+
+for _split, _block in SEGMENTATION_STATS.items():
+    for _lab, _row in _block.items():
+        _want = E9_EXPECTED[_split][_lab]
+        if _row["accepted"] != _want:
+            _pop_errors.append(
+                f"{_split}/{_lab}: accepted {_row['accepted']}, "
+                f"expected {_want}")
+
+assert not _pop_errors, (
+    "E9 is not reproducing E8's beat population: "
+    + "; ".join(_pop_errors)
+)
+
+# And the stats must agree with what actually landed in the arrays.
 for _split, _block, _y in (("DS1_TRAIN", SEGMENTATION_STATS["DS1_TRAIN"], y_train),
                            ("DS1_VAL", SEGMENTATION_STATS["DS1_VAL"], y_valid),
                            ("DS2", SEGMENTATION_STATS["DS2"], y_test)):
@@ -1311,6 +1312,10 @@ for _split, _block, _y in (("DS1_TRAIN", SEGMENTATION_STATS["DS1_TRAIN"], y_trai
         assert _row["accepted"] == _counter.get(_lab, 0), (
             f"{_split}/{_lab}: stats say {_row['accepted']} accepted but "
             f"the array holds {_counter.get(_lab, 0)}")
+
+print("\n  population matches E8 exactly except for "
+      f"{sum(E8_ACCEPTED[sp][lb] - E9_EXPECTED[sp][lb] for sp in E8_ACCEPTED for lb in ('N', 'S', 'V'))} "
+      "unreachable first-of-record beats (0 of them S)")
 
 
 
@@ -1405,39 +1410,15 @@ RR_test = apply_rr_norm(RR_test, RR_NORM_MEAN, RR_NORM_STD)
 # =========================================================
 
 # No expand_dims any more. Beats leave section 7 already shaped
-# (INPUT_LENGTH, N_INPUT_CHANNELS), so the Conv1D channel axis is the
-# wavelet scale axis plus the E8 mask channel. build_model() takes its
-# input shape from the data, so the branch widens from 9 to 10 channels
-# without a code change - the ONLY parameter difference against E6 is the
-# first Conv1D kernel, 5 * 9 * 32 + 32 = 1472 becoming
-# 5 * 10 * 32 + 32 = 1632, so +160 on a total of 239,171 -> 239,331.
+# (SEGMENT_LENGTH, N_WAVELET_SCALES), so the Conv1D channel axis is the
+# wavelet scale axis. build_model() takes its input shape from the data,
+# so the branch widens from 1 to 9 channels without a code change.
 
 for _name, _arr in (("train", X_train), ("valid", X_valid),
                     ("test", X_test)):
     assert _arr.ndim == 3, f"{_name}: expected 3 dims, got {_arr.shape}"
-    assert _arr.shape[1] == INPUT_LENGTH, f"{_name}: {_arr.shape}"
-    assert _arr.shape[2] == N_INPUT_CHANNELS, f"{_name}: {_arr.shape}"
-    assert _arr.dtype == np.float32, f"{_name}: {_arr.dtype}"
-
-    # The mask must be strictly binary, and the scalogram must be exactly
-    # zero wherever the mask is zero - if padding ever carried energy the
-    # network could read the boundary as signal.
-    #
-    # Checked in chunks: a whole-array np.isfinite() or boolean-index over
-    # (n, 720, 10) float32 allocates hundreds of megabytes on top of an
-    # array that is already over a gigabyte.
-    for _lo in range(0, len(_arr), 4096):
-
-        _chunk = _arr[_lo:_lo + 4096]
-        _mask = _chunk[:, :, MASK_CHANNEL_INDEX]
-        _energy = np.abs(_chunk[:, :, :N_WAVELET_SCALES]).sum(axis=2)
-
-        assert np.all((_mask == 0.0) | (_mask == 1.0)),             f"{_name}[{_lo}]: mask not binary"
-        assert not np.any(_energy[_mask == 0.0]),             f"{_name}[{_lo}]: non-zero scalogram energy inside the padding"
-        assert np.all(np.isfinite(_energy)),             f"{_name}[{_lo}]: non-finite values"
-        assert np.all(_mask.sum(axis=1) > 0),             f"{_name}[{_lo}]: a beat with an empty mask"
-
-        del _chunk, _mask, _energy
+    assert _arr.shape[1] == SEGMENT_LENGTH, f"{_name}: {_arr.shape}"
+    assert _arr.shape[2] == N_WAVELET_SCALES, f"{_name}: {_arr.shape}"
 
 print(f"\nCNN input shapes  train {X_train.shape}  "
       f"valid {X_valid.shape}  test {X_test.shape}")
@@ -1523,17 +1504,18 @@ y_test_cat = tf.keras.utils.to_categorical(
 
 SAMPLER = "balanced_batch"
 
-# E8 holds the sampler at E6's 1:1:1 and changes only the segmentation.
+# E9 holds the sampler at E6's 1:1:1 and changes only which beats exist.
 #
 # E7 swept this grid over [1, 2, 3, 4] and found it SATURATED: S recall
 # moved +0.0005 between ratio 1 and ratio 2 while S precision fell
 # 0.3934 -> 0.2789, and validation macro-F1 spanned only 0.0178 across the
-# whole grid. That question is settled, so the grid is a single point
-# here. Ratio 1.0 gives weights [1/3, 1/3, 1/3] - exactly E6's sampler.
+# whole grid. That question is settled, so the grid is a single point.
+# Ratio 1.0 gives weights [1/3, 1/3, 1/3] - exactly E6's sampler, and E7's
+# ratio-1.0 arm reproduced E6's selection (0.5540 at epoch 6) exactly.
 #
-# The sweep machinery is left in place rather than deleted so that the
-# selection path, the seed reset and the metrics.json shape are identical
-# to E6/E7; with one entry it simply trains one model.
+# The sweep machinery is left in place rather than deleted so the
+# selection path, the seed reset and the metrics.json shape are unchanged;
+# with one entry it simply trains one model.
 #
 # A ratio r means S is drawn r times as often as each of N and V:
 # weights proportional to [1, r, 1], normalised.
@@ -1557,50 +1539,25 @@ def weights_for_ratio(ratio, n_classes=NUM_CLASSES, minority_index=1):
     return [w / total for w in raw]
 
 
-def gather_training_batch(batch_indices):
-    """Fetch one batch by index from the full training arrays.
-
-    Fancy-indexing here copies only the batch - (BATCH_SIZE, 720, 10) is
-    under 4 MB - whereas the E6/E7 formulation sliced X_tr_aug with a
-    per-class boolean mask and handed the result to
-    from_tensor_slices(), which materialised the whole training set twice
-    over: once as three numpy sub-arrays and again as a TensorFlow
-    constant. At (234, 9) that was 371 MB a copy and did not matter; at
-    (720, 10) it is 1.27 GB a copy and does.
-    """
-
-    idx = np.asarray(batch_indices, dtype=np.int64)
-
-    return (
-        X_tr_aug[idx],
-        RR_tr_aug[idx],
-        y_tr_aug_cat[idx].astype(np.float32)
-    )
-
-
 def make_balanced_dataset(weights):
     """One infinite, class-balanced, batched stream for the given weights.
 
-    Each class becomes its own shuffled, repeated dataset of INDICES; the
-    classes are interleaved by sample_from_datasets according to
-    `weights`, and only then is the batch materialised. S beats repeat
-    from the real ones - nothing synthetic is created.
-
-    Streaming indices rather than beats keeps exactly one copy of the
-    training set in memory. The draw sequence is unaffected: tf.data's
-    shuffle and sample_from_datasets depend on the element COUNT and the
-    seed, never on element contents, so this yields the same beats in the
-    same order the E6 formulation would have.
+    Each class becomes its own shuffled, repeated dataset; the classes are
+    interleaved by sample_from_datasets according to `weights`. S beats
+    repeat from the real 670 - nothing synthetic is created.
     """
 
     per_class = []
 
     for class_index in range(NUM_CLASSES):
 
-        class_indices = np.where(y_tr_aug == class_index)[0].astype(np.int64)
-        n_class = int(class_indices.size)
+        mask = (y_tr_aug == class_index)
+        n_class = int(mask.sum())
 
-        class_ds = tf.data.Dataset.from_tensor_slices(class_indices)
+        class_ds = tf.data.Dataset.from_tensor_slices((
+            (X_tr_aug[mask], RR_tr_aug[mask]),
+            y_tr_aug_cat[mask]
+        ))
 
         class_ds = class_ds.shuffle(
             n_class,
@@ -1616,31 +1573,7 @@ def make_balanced_dataset(weights):
         seed=SEED
     )
 
-    stream = stream.batch(BATCH_SIZE)
-
-    def _materialise(batch_indices):
-
-        ecg, rr, target = tf.numpy_function(
-            func=gather_training_batch,
-            inp=[batch_indices],
-            Tout=[tf.float32, tf.float32, tf.float32]
-        )
-
-        # numpy_function erases static shape; restore it so Keras can
-        # build the graph.
-        ecg.set_shape((None, INPUT_LENGTH, N_INPUT_CHANNELS))
-        rr.set_shape((None, len(RR_FEATURE_NAMES)))
-        target.set_shape((None, NUM_CLASSES))
-
-        return (ecg, rr), target
-
-    stream = stream.map(
-        _materialise,
-        num_parallel_calls=tf.data.AUTOTUNE,
-        deterministic=True
-    )
-
-    return stream.prefetch(tf.data.AUTOTUNE)
+    return stream.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
 
 
 for _class_index in range(NUM_CLASSES):
@@ -2574,24 +2507,23 @@ metrics = {
 
         "LEAD_INDEX": LEAD_INDEX,
 
-        # E8. PRE_SAMPLES / POST_SAMPLES / SEGMENT_LENGTH above describe
-        # the FIXED window used up to E7 and are kept only for
-        # comparability; they no longer control segmentation.
-        "segmentation": "variable_R-1_to_R+1",
+        # E9: E6's fixed window, E8's acceptance rule. The span cap
+        # decides which beats exist; the model still sees SEGMENT_LENGTH
+        # samples at N_WAVELET_SCALES channels, with no mask and no
+        # padding.
+        "segmentation": "fixed_window_on_span_capped_population",
 
         "max_span_samples": MAX_SPAN_SAMPLES,
 
         "max_span_seconds": MAX_SPAN_SAMPLES / SAMPLING_RATE_HZ,
 
-        "input_length": INPUT_LENGTH,
+        "input_length": SEGMENT_LENGTH,
 
-        "n_input_channels": N_INPUT_CHANNELS,
+        "n_input_channels": N_WAVELET_SCALES,
 
         "n_wavelet_scales": N_WAVELET_SCALES,
 
-        "mask_channel_index": MASK_CHANNEL_INDEX,
-
-        "pad_side": "right",
+        "mask_channel_index": None,
 
         "loss": "categorical_crossentropy",
 
@@ -2648,13 +2580,23 @@ metrics = {
         "rr_norm_std": RR_NORM_STD.tolist()
     },
 
-    # Per class and per split: beats accepted, beats rejected for
-    # exceeding MAX_SPAN_SAMPLES, beats rejected at the signal edge, and
-    # the mean/std of the accepted window length. The cap drops long spans,
-    # which are usually compensatory pauses, so the rejection is BIASED
-    # toward the post-ectopic population - read the class counts here
-    # before comparing E8 with any earlier run.
+    # Per class and per split: accepted, rejected by E8's 2-second span
+    # cap, rejected because E6's fixed window runs off the record start,
+    # and the mean/std of the R-1..R+1 span. E9 scores 42,148 DS2 beats
+    # against E8's 42,154; the 6 missing beats are 5 N and 1 V, all
+    # first-of-record, and the S class is identical at 1,565 both sides.
     "segmentation_stats": SEGMENTATION_STATS,
+
+    "e8_population": E8_ACCEPTED,
+
+    "population_matches_e8_except": {
+        "beats": 12,
+        "in_ds2": 6,
+        "classes": {"N": 11, "S": 0, "V": 1},
+        "reason": "first annotated beat of a record; the R peak sits "
+                  "28-88 samples in, so the fixed r-90 window starts "
+                  "before sample 0. E8's R-1..R+1 window did not."
+    },
 
     "train_distribution": {
         str(label): int(count)

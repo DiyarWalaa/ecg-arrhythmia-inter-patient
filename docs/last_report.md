@@ -1,118 +1,127 @@
-# Last report — E8 recorded; E9 blocked on a 12-beat population mismatch
+# Last report — E9: E6's window on E8's beat population
 
-Two things happened: E8's returned artefact was recorded in the ablation
-table, and **E9 was stopped before implementation** because its stated
-acceptance test cannot be met.
+**Status: written and verified locally. NOT YET TRAINED.** No `results/E9_*`
+folder and no ablation row; E9 is pre-registered in the generated table's
+"Pre-registered, NOT YET RUN" section.
 
----
+## Why
 
-## Part 1 — E8 recorded
+E8 reached S-F1 0.4752 and S recall 0.6594 against E6's 0.3641 and 0.3388 —
+but changed **two** things at once: the representation *and* the beat
+population. Its 2-second span cap rejected 15.5% of N, 14.8% of S and 1.0% of
+V, so DS2 fell from 49,289 beats to 42,154. The gain cannot be attributed to
+the representation until both are scored on the same beats.
 
-`results/E8_variable_segmentation/` was untracked. It is now committed and
-`docs/ablation.md` has its row (17 runs, gate passed).
+E9 holds the representation at E6's and borrows only E8's acceptance rule.
 
-| | argmax | tuned | E6 argmax |
+## What changed
+
+Built by restoring E7's `src/train.py` — whose ratio-1.0 arm provably
+reproduces E6's selection (0.5540 at epoch 6) — and applying the filter,
+rather than un-patching E8. `ast.dump` against that base:
+
+| | |
+|---|---|
+| CHANGED (2) | `extract_beats_from_record`, `load_dataset` |
+| ADDED (3) | `empty_segmentation_stats`, `merge_segmentation_stats`, `summarize_segmentation_stats` |
+| IDENTICAL (17) | `build_model`, `make_balanced_dataset`, `augment_training_data`, `augment_segment`, `cwt_ricker`, `tune_decision_weights`, `weights_for_ratio`, `make_callbacks`, `normalize_segment`, +8 |
+
+Module-level: `MAX_SPAN_SAMPLES` added, `SAMPLER_RATIO_GRID` pinned to
+`[1.0]`, `metrics` extended. Nothing else.
+
+The span rule is applied **before** the window and never reaches the model:
+a beat is kept if `0 < ann[i+1] - ann[i-1] <= 720`; the model then sees the
+unchanged `r-90 .. r+144`.
+
+## Verification
+
+- `python -b -m py_compile src/train.py` — clean.
+- `build_model` **identical to both E6 and E8** by `ast.dump`. Parameter
+  arithmetic at 9 channels gives **239,171**, matching E6's published count
+  (the same formula gives E8's 239,331 at 10 channels).
+- 25-item unchanged-vs-E6 audit — all match: `DS1`, `DS2`, `DS1_VAL`,
+  `RR_FEATURE_NAMES` (5), `RR_CLIP_*`, `RR_LOCAL_WINDOW`,
+  `WAVELET_TARGET_FREQS_HZ`, `ADAM_LEARNING_RATE`, `BATCH_SIZE`, `EPOCHS`,
+  `SEED`, `LEAD_INDEX`, `PRE_SAMPLES` 90, `POST_SAMPLES` 144, `SAMPLER`,
+  `THRESHOLD_GRID`, `AAMI_MAP`, `cwt_ricker`, `augment_training_data`.
+- Wavelet widths 8.1028 … 0.9003 → centres 10 … 90 Hz. Sampler weights
+  [1/3, 1/3, 1/3]; loss plain `categorical_crossentropy`; augmentation
+  uncalled.
+- Shapes: DS1_TRAIN **(38536, 234, 9)**, DS1_VAL (6234, 234, 9), DS2
+  **(42148, 234, 9)**. All finite. Train memory 0.32 GB.
+
+Checks ran the **real functions**, AST-extracted from `src/train.py` and
+exec'd with numpy/wfdb only — nothing reimplemented.
+
+## Population — matches E8 exactly except for 12 unreachable beats
+
+The span-cap rejections reproduce E8's **identically**: DS1_TRAIN
+5280/33/227, DS1_VAL 179/0/81, DS2 6838/271/32.
+
+| split | E9 accepted | E8 accepted | difference |
 |---|---|---|---|
-| macro-F1 | 0.6495 | 0.6706 | 0.7263 |
-| S recall | **0.6594** | 0.4505 | 0.3388 |
-| S F1 | **0.4752** | 0.4565 | 0.3641 |
-| V F1 | 0.5661 | 0.6236 | 0.8503 |
-| accuracy | 0.8410 | 0.8785 | 0.9352 |
+| DS1_TRAIN | 35021 / 637 / 2878 | 35025 / 637 / 2878 | −4 N |
+| DS1_VAL | 5359 / 273 / 602 | 5361 / 273 / 602 | −2 N |
+| DS2 | **37395 / 1565 / 3188** | 37400 / 1565 / 3189 | −5 N, −1 V |
 
-**Every mechanical prediction from last session was exact:**
-`total_parameters` 239,331 · `steps_per_epoch` 302 · train N=35025 S=637
-V=2878 · DS2 37400/1565/3189 · weights [1/3,1/3,1/3] · input (720, 10).
+**E9 is scored on 42,148 DS2 beats against E8's 42,154.** The 6 excluded
+beats are **5 N and 1 V**, every one the first annotated beat of its record,
+where the R peak sits 28–88 samples in so E6's `r − 90` window starts before
+sample 0 and there is no signal to read. E8's `R−1..R+1` window did not have
+that problem.
 
-**The substantive predictions were wrong, and worth recording as wrong.**
-I predicted test S recall would stay below 0.50 — it reached **0.6594**. I
-predicted validation macro-F1 would beat E6's 0.5540 — it **fell to 0.5090**,
-selecting epoch 5. My own stated falsifier was "test S-F1 above 0.45"; it
-came in at 0.4752. So the reading that the DS2 span-gap collapse would cap
-the S gain is falsified on S.
+**The S class is identical on both sides at 1,565 beats**, so every S metric
+— recall, precision, F1 — is exactly comparable. N recall can move by at most
+1.3e-4 and V recall by at most 3.1e-4, bounding macro-F1 incomparability
+below **2e-4** against an E8-vs-E6 effect size of 0.08 — roughly **400×
+smaller than what is being measured**. Recorded in `metrics.json` under
+`population_matches_e8_except` and in the ablation note, so the comparison is
+precise rather than approximate.
 
-What I did not predict: **V collapsed.** V-F1 0.8503 → 0.5661, with 4,405 N
-beats called V. That, not S, is why macro-F1 fell to 0.6495 — E8 is the
-best run on S and one of the worse runs overall.
+Rejected alternatives: re-running E8 with the fixed-window edge rule would
+spend a full run to remove an uncertainty 400× below the effect;
+left-padding the window at the record start would fabricate a signal pattern
+the model sees nowhere else.
 
-Also notable: threshold tuning transferred again (+0.0211 on test) and the
-selected vector **down-weighted S** to w = [1.0, 0.25, 0.3536]. That is the
-second confirmation of the standing rule — the only two vectors that ever
-transferred, E6's and E8's, both leave `w_S` at or below `w_N`.
+A run-time assertion in section 12 hard-stops if the accepted counts are not
+exactly 35021/637/2878, 5359/273/602, 37395/1565/3188.
 
-### The gate now tracks which DS2 a row was scored on
+## Falsifiable prediction
 
-E8 scores 42,154 DS2 beats against the 49,289 every earlier row used. Rather
-than relax the support check, each run now declares a **population** and the
-gate refuses any artefact that disagrees with its declaration. The table has
-a new `DS2` column: every row reads `full` except E8's `span_capped_720`.
-Verified: re-declaring E8 as `full` is refused.
+**Mechanical, checkable on return — any mismatch is a bug, not a result:**
+`total_parameters` = **239,171** · `steps_per_epoch` = **302**
+(ceil(38536/128), same as E8's by coincidence of rounding; E6 ran 345) ·
+input (n, 234, 9) · train N=35021 S=637 V=2878 · DS2 42,148 beats
+37395/1565/3188 · `sampling_weights` [1/3, 1/3, 1/3] ·
+`mask_channel_index` null.
 
----
+**Substantive.** The E8 span cap removes the beats with long compensatory
+pauses — the post-ectopic N beats that most resemble an S beat under a fixed
+window. So E9 should land **between** E6 and E8 on S, and **above both on
+macro-F1**, since it does not inherit E8's V collapse (V-F1 0.5661, 4,405 N
+called V).
 
-## Part 2 — E9 stopped, as instructed
+Concretely: **E9 test S-F1 lands in [0.40, 0.50]** — above E6's 0.3641,
+at or below E8's 0.4752 — and **E9 macro-F1 exceeds E8's 0.6495**.
 
-> "If any count differs, the filter is not reproducing E8's population —
-> stop and report rather than proceeding."
+**What this decides.** If E9's S-F1 reaches ≥ 0.45, most of E8's S gain was
+the easier population, not the variable-length representation, and E8's
+headline should be restated. If E9's S-F1 stays ≤ 0.40, the representation is
+doing the work and E8's gain is real.
 
-The counts differ, by **12 beats**. This is not a bug in the filter; the two
-runs use different *edge* rules and the difference is unreachable under a
-fixed window.
+**Falsifier for my reasoning:** E9 S-F1 below 0.3641 (i.e. no better than E6
+despite the easier population) would mean the span cap does not remove the
+confusable N beats at all, and the population story is wrong in both
+directions.
 
-E8 rejects a beat when `R[i-1]..R[i+1]` leaves the signal. E6 rejects when
-`r-90 .. r+144` leaves it. Twelve beats pass the first and fail the second:
+## Also in this session
 
-| split | class | E8 rule | E9 = E6 window ∧ span ≤ 720 | short by |
-|---|---|---|---|---|
-| DS1_TRAIN | N | 35025 | 35021 | 4 |
-| DS1_VAL | N | 5361 | 5359 | 2 |
-| DS2 | N | 37400 | 37395 | 5 |
-| DS2 | V | 3189 | 3188 | 1 |
+E8's artefact was committed and its ablation row added (17 runs). The gate
+now tracks which DS2 population each row scored — `full`,
+`span_capped_720` (E8), `span_capped_720_fixed_window` (E9) — and refuses any
+artefact disagreeing with its declaration. Verified by negative test.
 
-**S matches exactly in all three splits** (637 / 273 / 1565), as do
-DS1_TRAIN V and DS1_VAL V.
+## Not done
 
-Every one of the 12 is the **first annotated beat of a record**, where the R
-peak sits 28–88 samples in, so `r - 90 < 0`:
-
-```
-101 r=83  window [-7,227)      207 r=50  window [-40,194)
-108 r=88  window [-2,232)      220 r=28  window [-62,172)
-118 r=68  window [-22,212)     100 r=77  window [-13,221)
-230 r=75  window [-15,219)     123 r=70  window [-20,214)
-210 r=57  window [-33,201)     214 r=58  window [-32,202)
-222 r=81  window [-9,225)      233 r=42  window [-48,186)  <- the V
-```
-
-There is no signal before sample 0, so a fixed 234-sample window cannot
-include them. Reproducing E8's population exactly would require padding the
-window at the record start, which changes E6's representation and violates
-"CHANGE NOTHING ELSE".
-
-### What this costs, quantified
-
-The DS2 difference is 6 beats out of 42,154 — **0.014%**, of which **zero are
-S**. Bounds on the resulting incomparability:
-
-- Every S metric — recall, precision, F1 — is computed on the identical 1,565
-  beats and is **exactly** comparable.
-- N support 37400 → 37395, so N recall moves by at most 1.3e-4.
-- V support 3189 → 3188, so V recall moves by at most 3.1e-4.
-- macro-F1 is therefore uncertain by **< 2e-4**, against an E8-vs-E6 effect
-  size of 0.08 — three orders of magnitude larger.
-
-Also worth weighing: baseline through E7 all excluded these same 12 beats,
-because they all used the fixed window. E9 excluding them keeps it consistent
-with the entire table; **E8 is the outlier that uniquely gained them.**
-
-### Recommendation
-
-Proceed with E9 on 42,148 DS2 beats, documenting the 12 exclusions and
-declaring a third DS2 population so the gate keeps the distinction visible.
-The S comparison — the entire point of E9 — is exact either way.
-
-Awaiting a decision rather than assuming one.
-
-## State
-
-- Committed and pushed: E8 artefact + ablation row + population gate.
-- `src/train.py` is **untouched** — still E8 as trained. No E9 code written.
+- E9 not trained. Kaggle run pending; the ablation row follows the artefact.
+- Record 114's swapped leads (known fact 2) remain unfixed — out of scope.
