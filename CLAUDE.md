@@ -27,32 +27,40 @@ progress, so every reported number must be traceable and reproducible.
 
 Established, verified, and not to be re-litigated:
 
-1. **Augmentation is ACTIVE again as of E0.** It was removed at step 4 and
-   **restored at E0**, because the step 4/5/6 configuration performed worse
-   and E0 exists to re-anchor on the step 3 training setup.
-   `augment_training_data()` is called from section 18 and expands
-   **S x7, V x3** (verified by AST call-graph, not grep).
+1. **Augmentation is GONE as of E6, and hard constraint 2 now holds.**
+   It was removed at step 4, **restored at E0** to re-anchor on the step 3
+   training setup, and **removed again at E6** - this time paired with a
+   replacement balancing mechanism, which is what the earlier removal
+   lacked. E6 balances by **sampling** rather than by duplicating: a
+   `balanced_batch` sampler draws N/S/V at `[1/3, 1/3, 1/3]`, and the loss
+   is plain `categorical_crossentropy`. Verified in
+   `results/E6_balanced_sampling/metrics.json`: `config.oversampling` is
+   `False`, `config.focal_loss_used` is `False`, `config.sampler` is
+   `balanced_batch`. E7 is an E6 derivative and used the same sampler by
+   construction, but its artefact was lost, so that is not independently
+   confirmable.
 
-   This **violates hard constraint 2** and is accepted deliberately, for
-   now. Two known defects come with it: the RR feature vector is copied
-   **unchanged** across every duplicate - which is worse than it was at
-   step 3, since those are now the five patient-relative ratios rather
-   than two raw intervals - and the `np.roll` shift moves the R-peak off
-   its aligned position. Removing it again is a later step, and it must be
-   paired with a replacement balancing mechanism.
+   **E0 through E5 violated hard constraint 2** (`config.oversampling` is
+   `True` in all six artefacts), deliberately and with two known defects:
+   `augment_training_data()` expanded **S x7, V x3** while copying the RR
+   feature vector **unchanged** across every duplicate - worse than at step
+   3, since those are the five patient-relative ratios rather than two raw
+   intervals - and the `np.roll` shift moved the R-peak off its aligned
+   position. **Read every number from baseline through E5 as produced under
+   data expansion.** E6 is the first clean run since step 5, and it is also
+   the best run, so nothing is being given up by keeping the constraint.
 
-   **Class balancing is in the data, not the loss.** `FOCAL_ALPHA` is back
-   to the **scalar 0.50**, which scales the whole loss and rebalances
-   nothing. The step 4 per-class alpha vector and the step 6 `BETA_GRID`
-   sweep were both reverted at E0.
+   **Class balancing moved from the data to the sampler, never to the
+   loss.** Through E5, `FOCAL_ALPHA` was the **scalar 0.50**, which scales
+   the whole loss and rebalances nothing; the step 4 per-class alpha vector
+   and the step 6 `BETA_GRID` sweep were both reverted at E0. Step 6 later
+   swept `BETA` properly and found it spans only 0.0606 across the entire
+   grid - see standing finding 2 under Current state. **Do not reach for a
+   loss-reweighting scheme again.**
 
-   **History, so old numbers are read correctly.** Runs **baseline through
-   step 3** were produced *with* augmentation active: it expanded S x7 and
-   V x3 while copying the RR feature vector unchanged across every copy.
-   The baseline ran 449 steps/epoch at batch 128 = 57,425 samples
-   = 41255 N + 849x7 S + 3409x3 V; without augmentation it would have been
-   356. Treat every metric from those runs as produced under data
-   expansion.
+   **History, so old numbers are read correctly.** The baseline ran 449
+   steps/epoch at batch 128 = 57,425 samples = 41255 N + 849x7 S + 3409x3 V;
+   without augmentation it would have been 356.
 
    Do not try to detect augmentation from `train_distribution` in
    `metrics.json` - that field is computed **before** the split and before
@@ -115,39 +123,88 @@ Established, verified, and not to be re-litigated:
 ## Current state
 
 See `docs/ablation.md` for the full run-by-run table - it is the source of
-truth and every number there is read programmatically from a
-`results/<run>/metrics.json`.
+truth. **Check its `source` column before quoting a number.** Fourteen rows
+are read programmatically from a `results/<run>/metrics.json`; two - **step
+6** and **E7** - are marked `console log`, because those Kaggle sessions
+expired before the artefact was written. Console rows are reconciled against
+their own printed confusion matrix and against DS2, but they cannot be
+re-derived from `results/` and must be re-run before anything from them goes
+in the paper.
 
-Best test macro-F1 so far is **step 2** (`5c1b9d6`) at 0.6800. The baseline
-(`b58d6b6`) scored 0.6358, but from a leaked validation split and the full
-22-record training pool, so it is not a fair target.
+Best test macro-F1 so far is **E6** (`5b3b203`) - balanced 1:1:1 batch
+sampling with plain cross-entropy, at 239,171 parameters, `DS1_VAL =
+['207','220','223']`, `best_epoch` 6.
 
-| run | macro-F1 | S F1 | S recall | accuracy |
-|---|---|---|---|---|
-| baseline | 0.6358 | 0.1728 | 0.1171 | 0.9294 |
-| step 2 | 0.6800 | 0.1942 | 0.1280 | 0.9476 |
-| step 3 | 0.6645 | 0.2138 | 0.1514 | 0.9451 |
-| E0 | 0.5591 | - | - | - |
+| run | macro-F1 | S F1 | S recall | S precision | V F1 | accuracy |
+|---|---|---|---|---|---|---|
+| E6 tuned | **0.7372** | 0.3653 | 0.3442 | 0.3892 | 0.8792 | 0.9395 |
+| E6 argmax | 0.7263 | 0.3641 | 0.3388 | 0.3934 | 0.8503 | 0.9352 |
+| E2 argmax | 0.7178 | 0.2686 | 0.1972 | 0.4214 | 0.9111 | 0.9503 |
+| E7 argmax | 0.7114 | 0.3061 | 0.3393 | 0.2789 | 0.8685 | 0.9261 |
+| step 2 | 0.6800 | 0.1942 | 0.1280 | 0.4024 | 0.8718 | 0.9476 |
 
-**E1 restores the step 3 configuration exactly** (step 3 training code +
-`DS1_VAL = ['207','220','223']`) and adds validation-tuned decision
-thresholds on top. Because the pipeline is deterministic, E1's
-**plain-argmax** test result should reproduce step 3's confusion matrix
-`[[43233,479,521],[692,278,866],[138,8,3074]]`. Any mismatch is a bug, not
-a result.
+E6's **tuned** row is the headline number; its argmax row is the one to
+compare against any run that does not tune thresholds. Step 2 (0.6800) was
+the best for a long stretch and is kept above as the pre-wavelet reference.
 
-**Blocking problem:** the model **under-calls S by roughly 6x**. It
-predicts S 584 times against 1836 true S beats. Crucially, our S
-*precision* (0.402) is already in line with the literature - de Chazal 2004
-at 0.385, Zhou 2021 at 0.415 - while our S *recall* is 0.128 against their
-0.759 and 0.894. Comparable precision with an order-of-magnitude worse
-recall points at the **decision rule**, not the features: the model ranks S
-reasonably but almost never lets it win the argmax.
+**Blocking problem, restated after E6.** S recall is **0.3442** against
+0.759 (de Chazal 2004) and 0.894 (Zhou 2021), while S precision **0.3892**
+remains in line with their 0.385 and 0.415. What changed is *why*. Through
+E1 the model barely called S at all - 584 S predictions against 1836 true S
+beats - so the decision rule was the obvious suspect. E6 predicts S **1581**
+times against those same 1836, i.e. at very nearly the right frequency, and
+still only 622 of them are correct. The model is no longer refusing to call
+S; **it cannot tell S from N.** That is a representation problem, not a
+threshold problem, and the four findings below say which levers are already
+spent.
 
-E1 addresses this directly with per-class decision weights `w`, tuned on
-validation and applied to DS2 once (`prediction = argmax(w * p)`). A
-secondary failure remains from step 3: freed S beats tend to land in **V**
-rather than S (S->V rose 251 -> 866).
+### Standing findings - established, do not re-run
+
+1. **The sampler is saturated (E7, console row).** Sweeping the S:N drawing
+   ratio over 1, 2, 3, 4 moved S recall by **+0.0005** (0.3388 -> 0.3393)
+   while S precision fell **0.3934 -> 0.2789** and N-called-S rose 938 ->
+   1526. Validation macro-F1 spanned only 0.0178 across the whole grid, so
+   the selection was inside the noise. More S exposure buys nothing; it only
+   trades precision away. E6's 1:1:1 is the right setting.
+
+2. **The focal-alpha BETA exponent is not a lever (step 6, console row).**
+   The grid `[0.0, 0.25, 0.41, 0.50]` spans **0.0606** in validation
+   macro-F1 end to end, and the flat `[1,1,1]` control lands within 0.0603
+   of the winner. Reweighting the loss by class frequency does not move this
+   problem. E6 dropped focal loss entirely for plain cross-entropy and beat
+   every focal run.
+
+3. **Capacity is not the constraint (E4).** Cutting the network from 239,171
+   to 16,283 parameters destroyed the minority class outright: the model
+   predicted S **11 times in total** against 1836 true S beats, S-F1 0.0000,
+   S recall 0.0000. Combined with E5 (a direct RR skip to the output layer
+   changed nothing), S is limited by neither overfitting nor RR attenuation.
+
+4. **Threshold tuning transfers only when S is left at parity with N.**
+   Coordinate ascent on validation has been run four times, and the sign of
+   the test-set change tracks one thing - whether `w_S` was raised above
+   `w_N`:
+
+   | run | w (N, S, V) | val change | **test change** |
+   |---|---|---|---|
+   | E1 | 1.0, **4.0**, 4.0 | +0.0588 | **-0.0495** |
+   | E2 | 1.0, **1.4142**, 0.5 | +0.0265 | **-0.0846** |
+   | E6 | 1.0, **1.0**, 0.3536 | +0.0017 | **+0.0108** |
+   | E7 | 1.0, **1.4142**, 4.0 | - | **-0.0170** |
+
+   The only vector that transferred is E6's, which **does not upweight S at
+   all** and downweights V to 0.354. Every run that raised `w_S` lost on
+   test, including E2 at a mild 1.41x - which lost the most of any of them.
+   Note also that the bigger the validation gain, the worse the test result:
+   tuning two minority weights against **273 validation S beats** overfits
+   the validation set. Do not tune `w_S` upward again without a larger
+   validation S pool.
+
+**What is left.** The four spent levers are all *rebalancing* levers - loss
+weights, sampling ratios, decision thresholds, capacity. None of them
+addresses the fact that the representation does not separate S from N. The
+remaining directions are the input representation and the RR context window,
+not another rebalancing knob.
 
 ---
 

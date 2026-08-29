@@ -20,9 +20,25 @@ check.
 
 ADDING A RUN
 ------------
-Append to RUNS: (step, folder, commit, description, expectations, note).
-`expectations` is a dict of config/top-level keys the file must satisfy - a
-literal value, or a callable taking the value and returning bool.
+Append to RUNS: (step, folder, commit, description, spec, note).
+
+For an ordinary run, `folder` is the results/ directory and `spec` is a dict
+of config/top-level keys the metrics.json must satisfy - a literal value, or
+a callable taking the value and returning bool.
+
+CONSOLE-LOG ROWS
+----------------
+Two Kaggle sessions expired before metrics.json was written, so step 6 and E7
+have no artefact to read. Those rows set `folder = None` and put the run's
+console output in `spec` (see CONSOLE_SPEC below). They are marked
+**console log** in the source column of the table and are lower-provenance
+than every other row - do not use them as a reference for a later run.
+
+They are NOT unchecked. check_console_run() recomputes the full per-class
+report from the confusion matrix the console printed and refuses the row
+unless every scalar the console *also* printed agrees to within 5e-5, and
+unless the per-class support matches DS2 as measured by the archived runs.
+Nothing in a console row is typed twice and left unreconciled.
 """
 
 import argparse
@@ -35,6 +51,10 @@ import sys
 RESULTS = "results"
 OUT = os.path.join("docs", "ablation.md")
 
+# Provenance labels for the table's source column.
+ARTEFACT_SOURCE = "`metrics.json`"
+CONSOLE_SOURCE = "**console log**"
+
 
 def _is_vec3(v):
     return isinstance(v, list) and len(v) == 3
@@ -44,7 +64,51 @@ def _all_positive_ints(v):
     return isinstance(v, list) and all(isinstance(x, int) and x > 0 for x in v)
 
 
-# (step, folder, commit, description, expectations, note)
+CLASSES = ("N", "S", "V")
+
+# Tolerance for reconciling a console-printed scalar against the value
+# recomputed from the console-printed confusion matrix. The console prints
+# 4 decimal places, so correct rounding cannot be off by more than 5e-5.
+CONSOLE_TOL = 5e-5
+
+
+def report_from_cm(cm):
+    """Rebuild a classification report from a confusion matrix.
+
+    Rows are true classes, columns predicted, both in CLASSES order. Returns
+    (report, accuracy) shaped like the sklearn dict the artefacts carry.
+    """
+    total = sum(sum(row) for row in cm)
+    rep = {}
+    for i, c in enumerate(CLASSES):
+        tp = cm[i][i]
+        support = sum(cm[i])
+        predicted = sum(cm[r][i] for r in range(len(CLASSES)))
+        prec = tp / predicted if predicted else 0.0
+        rec = tp / support if support else 0.0
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+        rep[c] = {"precision": prec, "recall": rec, "f1-score": f1,
+                  "support": support}
+    rep["macro avg"] = {
+        k: sum(rep[c][k] for c in CLASSES) / len(CLASSES)
+        for k in ("precision", "recall", "f1-score")}
+    rep["macro avg"]["support"] = total
+    accuracy = sum(cm[i][i] for i in range(len(CLASSES))) / total
+    return rep, accuracy
+
+
+# CONSOLE_SPEC, the `spec` slot of a console row:
+#   run_name            the folder the run WOULD have written
+#   docs_commit         hash supplied with the console log (the last_report
+#                       commit, not the code commit in the table)
+#   best_val_macro_f1   validation score of the selected configuration
+#   sweep               (heading, [(label, val_macro_f1, epoch, selected)])
+#   argmax / tuned      {"confusion_matrix": [...], "printed": {...}}
+#                       `printed` holds the scalars the console stated; every
+#                       one is reconciled against the matrix.
+#   weights             tuned decision weights, if the run tuned any
+
+# (step, folder, commit, description, spec, note)
 RUNS = [
     ("0", "baseline", "b58d6b6",
      "colleague's script, paths made configurable",
@@ -107,6 +171,30 @@ RUNS = [
       "config.ds1_val": ["106", "118", "207", "220", "223"],
       "config.oversampling": False},
      None),          # assembled from the artefacts - see step5_note()
+
+    # CONSOLE-LOG ROW - the Kaggle session expired before metrics.json was
+    # written. Everything below is transcribed from the run's console output;
+    # check_console_run() reconciles it. Commit is the code commit 25229d9;
+    # the hash carried with the log, d7f6e02, is the docs commit after it.
+    ("6", None, "25229d9",
+     "validation-selected focal BETA sweep [0.0, 0.25, 0.41, 0.50]",
+     {"run_name": "step6_beta_sweep",
+      "docs_commit": "d7f6e02",
+      "best_val_macro_f1": 0.6025,
+      "sweep": ("BETA", [("0.00", 0.5422, 2, False),
+                         ("0.25", 0.5419, 5, False),
+                         ("0.41", 0.5885, 6, False),
+                         ("0.50", 0.6025, 2, True)]),
+      "argmax": {
+          "confusion_matrix": [[41102, 710, 2421],
+                               [581, 130, 1125],
+                               [470, 23, 2727]],
+          "printed": {"accuracy": 0.8919, "macro avg.f1-score": 0.5408,
+                      "S.f1-score": 0.0963, "V.f1-score": 0.5745}},
+      # Step 5 ran the selected BETA at the same seed, so an identical
+      # result is the expected outcome and is verified against that artefact.
+      "reproduces": "step5_bigger_val"},
+     None),          # assembled from the console log - see step6_note()
 
     ("E0", "E0_reanchor", "042597b",
      "re-anchor: step 3 training config, 5-record validation",
@@ -177,6 +265,37 @@ RUNS = [
       "config.oversampling": False,
       "config.total_parameters": 239171},
      None),          # assembled from the artefacts - see e6_note()
+
+    # CONSOLE-LOG ROW - see the step 6 row above. Commit is the code commit
+    # 1339261; the hash carried with the log, c3042ad, is the docs commit.
+    ("E7", None, "1339261",
+     "sampler S:N ratio sweep [1, 2, 3, 4]",
+     {"run_name": "E7_sampler_ratio",
+      "docs_commit": "c3042ad",
+      "best_val_macro_f1": 0.5620,
+      # Ratio 1 is E6's [1/3, 1/3, 1/3] sampler, so this sweep entry must
+      # reproduce E6's selection exactly; the gate checks it against E6's
+      # metrics.json rather than taking the console log's word for it.
+      "sweep_reproduces": ("1.0", "E6_balanced_sampling"),
+      "sweep": ("S:N ratio", [("1.0", 0.5540, 6, False),
+                              ("2.0", 0.5620, 3, True),
+                              ("3.0", 0.5563, 3, False),
+                              ("4.0", 0.5442, 2, False)]),
+      "argmax": {
+          "confusion_matrix": [[41937, 1526, 770],
+                               [1180, 623, 33],
+                               [47, 85, 3088]],
+          "printed": {"accuracy": 0.9261, "macro avg.f1-score": 0.7114,
+                      "S.recall": 0.3393, "S.precision": 0.2789,
+                      "S.f1-score": 0.3061, "V.f1-score": 0.8685}},
+      "tuned": {
+          "confusion_matrix": [[41437, 1555, 1241],
+                               [1147, 636, 53],
+                               [28, 67, 3125]],
+          "printed": {"accuracy": 0.9170, "macro avg.f1-score": 0.6944,
+                      "S.f1-score": 0.3107, "V.f1-score": 0.8182}},
+      "weights": [1.0, 1.4142, 4.0]},
+     None),          # assembled from the console log - see e7_note()
 ]
 
 
@@ -227,20 +346,145 @@ def check_run(folder, expectations, seen_hashes):
     return m
 
 
+def check_console_run(spec, ds2_support):
+    """Reconcile a console-log row against itself, then against DS2.
+
+    A console row has no artefact to hash, so the duplicate check cannot
+    protect it. What can be checked is that the confusion matrix the console
+    printed actually produces the scalars the console printed beside it, and
+    that it scores the same DS2 every archived run scored. Both are enforced;
+    a row that fails either is refused rather than published.
+
+    Returns the spec with a recomputed `report` and `accuracy` attached to
+    each decision rule, so nothing downstream re-derives a number by hand.
+    """
+    name = spec["run_name"]
+    out = dict(spec)
+
+    for rule in ("argmax", "tuned"):
+        if rule not in spec:
+            continue
+        block = dict(spec[rule])
+        cm = block["confusion_matrix"]
+
+        if len(cm) != len(CLASSES) or any(len(r) != len(CLASSES) for r in cm):
+            raise GateError("%s/%s: confusion matrix is not %dx%d"
+                            % (name, rule, len(CLASSES), len(CLASSES)))
+
+        report, accuracy = report_from_cm(cm)
+
+        got_support = {c: report[c]["support"] for c in CLASSES}
+        if got_support != ds2_support:
+            raise GateError(
+                "%s/%s: per-class support %r does not match DS2 %r as "
+                "measured by the archived runs. The console matrix is not "
+                "scoring the same test set."
+                % (name, rule, got_support, ds2_support))
+
+        for key, printed in block["printed"].items():
+            cls, _, field = key.partition(".")
+            recomputed = accuracy if key == "accuracy" else report[cls][field]
+            if abs(recomputed - printed) > CONSOLE_TOL:
+                raise GateError(
+                    "%s/%s: console printed %s = %.4f but its own confusion "
+                    "matrix gives %.6f (tolerance %g). The transcription is "
+                    "wrong somewhere. Refusing to emit a row."
+                    % (name, rule, key, printed, recomputed, CONSOLE_TOL))
+
+        block["report"] = report
+        block["accuracy"] = accuracy
+        out[rule] = block
+
+    if "reproduces" in spec:
+        ref = json.load(open(os.path.join(RESULTS, spec["reproduces"],
+                                          "metrics.json")))
+        ref_cm = ref.get("confusion_matrix") or ref["test_argmax"][
+            "confusion_matrix"]
+        if ref_cm != spec["argmax"]["confusion_matrix"]:
+            raise GateError(
+                "%s: claims to reproduce %s but the confusion matrices "
+                "differ (%r vs %r)."
+                % (name, spec["reproduces"], spec["argmax"]["confusion_matrix"],
+                   ref_cm))
+
+    if "sweep_reproduces" in spec:
+        label, ref_run = spec["sweep_reproduces"]
+        entry = [e for e in spec["sweep"][1] if e[0] == label]
+        if len(entry) != 1:
+            raise GateError("%s: sweep has no entry %r to reproduce %s"
+                            % (name, label, ref_run))
+        _lab, f1, epoch, _sel = entry[0]
+        ref = json.load(open(os.path.join(RESULTS, ref_run, "metrics.json")))
+        if (abs(f1 - ref["best_val_macro_f1"]) > CONSOLE_TOL
+                or epoch != ref["best_epoch"]):
+            raise GateError(
+                "%s: sweep entry %s = %.4f at epoch %d claims to reproduce "
+                "%s, which selected %.4f at epoch %d."
+                % (name, label, f1, epoch, ref_run,
+                   ref["best_val_macro_f1"], ref["best_epoch"]))
+
+    sel = [s for s in spec["sweep"][1] if s[3]]
+    if len(sel) != 1:
+        raise GateError("%s: sweep must mark exactly one selected setting, "
+                        "found %d" % (name, len(sel)))
+    if abs(sel[0][1] - spec["best_val_macro_f1"]) > CONSOLE_TOL:
+        raise GateError(
+            "%s: best_val_macro_f1 %.4f does not match the selected sweep "
+            "entry %s = %.4f" % (name, spec["best_val_macro_f1"],
+                                 sel[0][0], sel[0][1]))
+
+    return out
+
+
+def ds2_support(loaded):
+    """Per-class DS2 support, taken from the archived runs and required equal.
+
+    Every run scores the same untouched DS2. If the artefacts disagree about
+    how many N/S/V beats that is, the console rows have nothing to be checked
+    against and the table is not internally consistent either.
+    """
+    seen = {}
+    for step, folder, _c, _d, _n, m, _h in loaded:
+        if folder is None:
+            continue
+        cm = m.get("confusion_matrix") or m["test_argmax"]["confusion_matrix"]
+        sup = tuple(sum(row) for row in cm)
+        seen.setdefault(sup, []).append(step)
+    if len(seen) != 1:
+        raise GateError("archived runs disagree on DS2 support: %r" % (seen,))
+    sup = next(iter(seen))
+    return dict(zip(CLASSES, sup))
+
+
 # -------------------------------------------------------------------- notes
 
 def _history(folder):
+    if folder is None:          # console-log row: no artefacts at all
+        return None
     path = os.path.join(RESULTS, folder, "history.json")
     if not os.path.exists(path):
         return None
     return json.load(open(path))
 
 
-def val_gap(m):
-    if m.get("best_val_macro_f1") is None:
+def row_view(folder, m):
+    """The four table-level facts, for an artefact run or a console row.
+
+    Returns (report, accuracy, best_val_macro_f1, source). Both kinds of row
+    go through this, so the table cannot end up reading one kind by hand.
+    """
+    if folder is None:
+        return (m["argmax"]["report"], m["argmax"]["accuracy"],
+                m["best_val_macro_f1"], CONSOLE_SOURCE)
+    return (m["classification_report"], m["test_accuracy"],
+            m.get("best_val_macro_f1"), ARTEFACT_SOURCE)
+
+
+def val_gap(folder, m):
+    report, _acc, best_val, _s = row_view(folder, m)
+    if best_val is None:
         return None
-    return (m["classification_report"]["macro avg"]["f1-score"]
-            - m["best_val_macro_f1"])
+    return report["macro avg"]["f1-score"] - best_val
 
 
 def step4_note(m, h, gaps):
@@ -482,9 +726,126 @@ def e6_note(m, h, gaps):
              be=m["best_epoch"])
 
 
-ASSEMBLED = {"4": step4_note, "5": step5_note, "E1": e1_note,
-             "E2": e2_note, "E3": e3_note, "E4": e4_note, "E5": e5_note,
-             "E6": e6_note}
+# --------------------------------------------------- console-log run notes
+
+CONSOLE_PROVENANCE = (
+    "**FROM THE CONSOLE LOG - the artefact was not archived.** The Kaggle "
+    "session expired before `metrics.json` was written, so there is no "
+    "`results/{run}/` folder behind this row and nothing in it was read "
+    "programmatically. The confusion {mats} below {is_are} what the run's "
+    "console printed; every other number in the row is recomputed from "
+    "{it_them} by `report_from_cm()` and reconciled against the scalars the "
+    "console printed alongside (agreement to within 5e-5 is required), with "
+    "the per-class support checked equal to the DS2 the archived runs score. "
+    "**Treat this row as lower-provenance than every other row in the table, "
+    "and do not use it as the reference point for a later run.** The commit "
+    "above is the code commit; `{docs}` is the `docs: last_report` commit "
+    "that followed it and was the hash carried with the log."
+)
+
+
+def _sweep_table(spec):
+    label, entries = spec["sweep"]
+    out = ["  | %s | best val macro-F1 | at epoch | selected |" % label,
+           "  |---|---|---|---|"]
+    for name, f1, epoch, selected in entries:
+        out.append("  | %s | %.4f | %d | %s |"
+                   % (name, f1, epoch, "**selected**" if selected else ""))
+    return "\n".join(out)
+
+
+def _provenance(spec):
+    n = sum(1 for r in ("argmax", "tuned") if r in spec)
+    return CONSOLE_PROVENANCE.format(
+        run=spec["run_name"], docs=spec["docs_commit"],
+        mats="matrix" if n == 1 else "matrices",
+        is_are="is" if n == 1 else "are",
+        it_them="it" if n == 1 else "them")
+
+
+def step6_note(spec, h, gaps):
+    """Step 6 swept BETA and reproduced step 5 exactly."""
+    a = spec["argmax"]["report"]
+    vals = [e[1] for e in spec["sweep"][1]]
+    return (
+        "{prov}\n\n"
+        "{sweep}\n\n"
+        "  **The entire grid spans {span:.4f} in validation macro-F1** - "
+        "from `BETA=0.0`, which is no reweighting at all, to the most "
+        "aggressive setting swept. Class reweighting through the focal alpha "
+        "exponent is not an effective lever on this problem: the flat "
+        "`[1,1,1]` control lands within {ctrl:.4f} of the winner.\n\n"
+        "  **The test result is byte-identical to step 5**: confusion matrix "
+        "`{cm}`, verified equal to `results/{ref}/metrics.json` by the "
+        "generator. Step 5 already trained at the selected BETA from the "
+        "same seed, so this is a **determinism confirmation, not an "
+        "independent measurement** - macro-F1 {m:.4f}, S-F1 {s:.4f} and V-F1 "
+        "{v:.4f} all repeat step 5's exactly. Two identical rows are also "
+        "the precise signature the duplicate-hash gate exists to catch; here "
+        "it is the expected outcome, and it is checked against the step 5 "
+        "artefact rather than assumed."
+    ).format(prov=_provenance(spec), sweep=_sweep_table(spec),
+             span=max(vals) - min(vals),
+             ctrl=spec["best_val_macro_f1"] - vals[0],
+             cm=spec["argmax"]["confusion_matrix"], ref=spec["reproduces"],
+             m=a["macro avg"]["f1-score"], s=a["S"]["f1-score"],
+             v=a["V"]["f1-score"])
+
+
+def e7_note(spec, h, gaps):
+    """E7 swept the sampler ratio, failed its criterion, and found saturation."""
+    a = spec["argmax"]["report"]
+    t = spec["tuned"]["report"]
+    e6 = json.load(open(os.path.join(RESULTS, "E6_balanced_sampling",
+                                     "metrics.json")))
+    e6a = e6["test_argmax"]["classification_report"]
+    e6t = e6["test_tuned"]["classification_report"]
+    vals = [e[1] for e in spec["sweep"][1]]
+    return (
+        "{prov}\n\n"
+        "  **FAILED its stated criterion** (S-F1 > 0.40 and macro-F1 >= "
+        "{crit:.4f}, E6's argmax score): it scored macro-F1 {m:.4f} and "
+        "S-F1 {s:.4f}.\n\n"
+        "{sweep}\n\n"
+        "  **The sampler is SATURATED.** Doubling S exposure moved S recall "
+        "by **{dr:+.4f}** ({r0:.4f} -> {r1:.4f}) while S precision fell "
+        "{p0:.4f} -> {p1:.4f} and N-called-S rose {n0} -> {n1}. Drawing S "
+        "more often does not make the model find more S - it only makes it "
+        "guess S more often on N. S recall is pinned near 0.34 across the "
+        "whole grid.\n\n"
+        "  The `ratio 1.0` arm is E6's sampler, and it reproduces E6's "
+        "selection exactly - {r1f1:.4f} at epoch {r1e}, verified against "
+        "`results/E6_balanced_sampling/metrics.json` - so the sweep was "
+        "correctly anchored even though its own artefact was lost.\n\n"
+        "  **The selection was within noise.** Validation macro-F1 spans "
+        "only {span:.4f} across all four ratios, narrower than the "
+        "single-epoch validation swings already seen at step 4 (0.1497) and "
+        "step 5 (0.0724), so which ratio won is not a meaningful "
+        "result.\n\n"
+        "  Threshold tuning did not transfer either: w = {w} took test "
+        "macro-F1 {m:.4f} -> {mt:.4f} and accuracy {aa:.4f} -> {at:.4f}, "
+        "after it had transferred at E6. **E6 remains the best run**, at "
+        "macro-F1 {e6m:.4f} argmax / {e6t:.4f} tuned."
+    ).format(prov=_provenance(spec), sweep=_sweep_table(spec),
+             crit=e6a["macro avg"]["f1-score"],
+             m=a["macro avg"]["f1-score"], s=a["S"]["f1-score"],
+             dr=a["S"]["recall"] - e6a["S"]["recall"],
+             r0=e6a["S"]["recall"], r1=a["S"]["recall"],
+             p0=e6a["S"]["precision"], p1=a["S"]["precision"],
+             n0=e6["test_argmax"]["confusion_matrix"][0][1],
+             n1=spec["argmax"]["confusion_matrix"][0][1],
+             span=max(vals) - min(vals),
+             w=[round(x, 4) for x in spec["weights"]],
+             mt=t["macro avg"]["f1-score"],
+             aa=spec["argmax"]["accuracy"], at=spec["tuned"]["accuracy"],
+             r1f1=e6["best_val_macro_f1"], r1e=e6["best_epoch"],
+             e6m=e6a["macro avg"]["f1-score"],
+             e6t=e6t["macro avg"]["f1-score"])
+
+
+ASSEMBLED = {"4": step4_note, "5": step5_note, "6": step6_note,
+             "E1": e1_note, "E2": e2_note, "E3": e3_note, "E4": e4_note,
+             "E5": e5_note, "E6": e6_note, "E7": e7_note}
 
 
 # --------------------------------------------------------------------- build
@@ -492,30 +853,44 @@ ASSEMBLED = {"4": step4_note, "5": step5_note, "E1": e1_note,
 def build():
     seen = {}
     loaded = []
-    for step, folder, commit, desc, exp, note in RUNS:
-        m = check_run(folder, exp, seen)
+    for step, folder, commit, desc, spec, note in RUNS:
+        m = spec if folder is None else check_run(folder, spec, seen)
         loaded.append((step, folder, commit, desc, note, m, _history(folder)))
 
+    # DS2 is measured from the archived runs, then every console row's
+    # confusion matrix is required to score that same DS2.
+    support = ds2_support(loaded)
+    loaded = [(step, folder, commit, desc, note,
+               check_console_run(m, support) if folder is None else m, h)
+              for step, folder, commit, desc, note, m, h in loaded]
+
     gaps = {}
-    for step, _f, _c, _d, _n, m, _h in loaded:
-        g = val_gap(m)
+    for step, folder, _c, _d, _n, m, _h in loaded:
+        g = val_gap(folder, m)
         if g is not None:
             gaps[step] = g
 
     rows, notes = [], []
     for step, folder, commit, desc, note, m, h in loaded:
-        r = m["classification_report"]
-        td = m["train_distribution"]
+        r, acc, _bv, source = row_view(folder, m)
 
         rows.append(
             "| {s} | {d} | `{c}` | {mf1:.4f} | {sr:.4f} | {sp:.4f} | "
-            "{sf:.4f} | {vf:.4f} | {acc:.4f} |".format(
+            "{sf:.4f} | {vf:.4f} | {acc:.4f} | {src} |".format(
                 s=step, d=desc, c=commit,
                 mf1=r["macro avg"]["f1-score"], sr=r["S"]["recall"],
                 sp=r["S"]["precision"], sf=r["S"]["f1-score"],
-                vf=r["V"]["f1-score"], acc=m["test_accuracy"]))
+                vf=r["V"]["f1-score"], acc=acc, src=source))
 
-        if h is None:
+        if folder is None:
+            label, entries = m["sweep"]
+            chosen = [e for e in entries if e[3]][0]
+            sel = (" Swept {lab} over {n} settings; selection on "
+                   "`val_macro_f1` chose **{lab} = {v}** (best val macro-F1 "
+                   "{bv:.4f}, at epoch {ep}).".format(
+                       lab=label, n=len(entries), v=chosen[0],
+                       bv=chosen[1], ep=chosen[2]))
+        elif h is None:
             sel = ""
         elif m.get("best_epoch") is not None:
             sel = (" Ran {e} epochs; selection on `val_macro_f1` chose "
@@ -537,21 +912,29 @@ def build():
 
         body = ASSEMBLED[step](m, h, gaps) if step in ASSEMBLED else note
 
-        notes.append(
-            "- **step {s}** (`{f}`) - train distribution N={N} / S={S} / "
-            "V={V}.{sel}\n  {x}".format(
-                s=step, f=folder, N=td["N"], S=td["S"], V=td["V"],
-                sel=sel, x=body or ""))
+        if folder is None:
+            lead = ("- **step {s}** (`{f}` - **no archived artefact**) - "
+                    "train distribution not recoverable; the console log "
+                    "did not print it.{sel}\n  {x}").format(
+                        s=step, f=m["run_name"], sel=sel, x=body or "")
+        else:
+            td = m["train_distribution"]
+            lead = ("- **step {s}** (`{f}`) - train distribution N={N} / "
+                    "S={S} / V={V}.{sel}\n  {x}").format(
+                        s=step, f=folder, N=td["N"], S=td["S"], V=td["V"],
+                        sel=sel, x=body or "")
+        notes.append(lead)
 
     doc = HEADER + "\n".join(rows) + "\n\n## Notes\n\n" + "\n\n".join(notes)
 
     doc += GAP_HEADER
-    for step, _f, _c, _d, _n, m, _h in loaded:
+    for step, folder, _c, _d, _n, m, _h in loaded:
         if step not in gaps:
             continue
-        t = m["classification_report"]["macro avg"]["f1-score"]
-        doc += "| {s} | {v:.4f} | {t:.4f} | {g:+.4f} |\n".format(
-            s=step, v=m["best_val_macro_f1"], t=t, g=gaps[step])
+        r, _acc, bv, source = row_view(folder, m)
+        doc += "| {s} | {v:.4f} | {t:.4f} | {g:+.4f} | {src} |\n".format(
+            s=step, v=bv, t=r["macro avg"]["f1-score"], g=gaps[step],
+            src=source)
 
     doc += FOOTER
     return doc
@@ -559,24 +942,36 @@ def build():
 
 HEADER = """# Ablation log
 
-Generated by `tools/make_ablation.py` - do not edit by hand. Every number is
-read from a `results/<run>/metrics.json`; the generator refuses to emit a row
-whose metrics file does not identify itself as the run the table claims.
+Generated by `tools/make_ablation.py` - do not edit by hand.
+
+**Check the `source` column before you quote a number.** Most rows are read
+programmatically from a `results/<run>/metrics.json`, and the generator
+refuses to emit one whose metrics file does not identify itself as the run
+the table claims. Two rows - **step 6** and **E7** - are marked
+`console log`: their Kaggle sessions expired before `metrics.json` could be
+written, so those numbers are transcribed from the run's console output and
+no artefact exists behind them. They are reconciled (every console-printed
+scalar must match the confusion matrix the console printed beside it, to
+within 5e-5, and that matrix must score the same DS2 as the archived runs)
+but they are **not** artefact-backed, they cannot be re-derived from
+`results/`, and they should not be used as the reference point for a later
+run or quoted in the paper without re-running them.
 
 Rules (see CLAUDE.md): ONE change per run, and nothing is ever tuned against
 DS2. All metrics below are on DS2 (inter-patient test set).
 
-> **Validation set changed at step 5.** Rows **baseline through step 4** used
-> a 3-record validation set, `DS1_VAL = ['207','220','223']`. From **step 5**
-> onward it is 5 records, `['106','118','207','220','223']`, and the training
-> pool shrinks from 44,076 to 39,774 beats. Test-set metrics below are all on
-> the same untouched DS2, so the columns remain meaningful - but model
-> *selection* changed, and `FOCAL_ALPHA` shifts because it is derived from
-> DS1_TRAIN counts. **Step 5 onward is not a like-for-like comparison with
-> what precedes it.**
+> **Validation set changed at step 5 and changed back at E1.** Rows
+> **baseline through step 4** used a 3-record validation set,
+> `DS1_VAL = ['207','220','223']`. **Steps 5, 6 and E0** used the 5-record
+> set `['106','118','207','220','223']`, with the training pool shrinking
+> from 44,076 to 39,774 beats; **E1 onward** is back to the 3-record set.
+> Test-set metrics below are all on the same untouched DS2, so the columns
+> remain meaningful - but model *selection* differs, and `FOCAL_ALPHA`
+> shifts because it is derived from DS1_TRAIN counts. **Steps 5, 6 and E0
+> are not like-for-like comparisons with anything outside that window.**
 
-| step | description | commit | macro-F1 | S recall | S precision | S F1 | V F1 | accuracy |
-|---|---|---|---|---|---|---|---|---|
+| step | description | commit | macro-F1 | S recall | S precision | S F1 | V F1 | accuracy | source |
+|---|---|---|---|---|---|---|---|---|---|
 """
 
 GAP_HEADER = """
@@ -586,8 +981,8 @@ GAP_HEADER = """
 A model selected on a trustworthy validation signal should not score wildly
 differently on test. The gap is `test macro-F1 - best_val_macro_f1`:
 
-| step | best val macro-F1 | test macro-F1 | gap |
-|---|---|---|---|
+| step | best val macro-F1 | test macro-F1 | gap | source |
+|---|---|---|---|---|
 """
 
 FOOTER = """
@@ -606,9 +1001,8 @@ stopped the run at epoch 8. Their macro-F1 drop to 0.4569 / 0.4742 measures
 that selection failure, **not** the patient-wise split or the RR fix.
 
 Step 2 changed the selection metric and the same pipeline reached macro-F1
-0.6800 - still the best result of any run. Step 3 is the first step to move
-the S->N leak (73.5% -> 37.7%), at the cost of macro-F1, because the freed S
-beats went to V rather than to S.
+0.6800. Step 3 is the first step to move the S->N leak (73.5% -> 37.7%), at
+the cost of macro-F1, because the freed S beats went to V rather than to S.
 
 Step 4 removed duplicate oversampling and replaced the scalar focal alpha
 (which rebalanced nothing) with a per-class vector. Its 0.5599 does not
@@ -618,10 +1012,30 @@ Step 5 enlarged the validation set and cut selection variance by half, which
 is what it was for. It also made the real problem legible: the model predicts
 V roughly twice as often as V occurs.
 
-Step 6 sweeps `BETA` over `[0.0, 0.25, 0.41, 0.50]` and lets DS1_VAL pick.
-`BETA=0.41` reproduces the 3.000 V:N emphasis of the old oversampling;
-`BETA=0.0` is a flat `[1,1,1]` control that answers whether reweighting was
-ever helping.
+Step 6 swept `BETA` over `[0.0, 0.25, 0.41, 0.50]` and let DS1_VAL pick.
+`BETA=0.41` reproduces the 3.000 V:N emphasis of the old oversampling and
+`BETA=0.0` is a flat `[1,1,1]` control. The control came within 0.0603 of the
+winner and the whole grid spanned 0.0606, so the answer is that **the focal
+alpha exponent is not a lever on this problem at all**. The winning setting
+was step 5's, from the same seed, and reproduced step 5's confusion matrix
+exactly.
+
+The wavelet arc (E2-E5) then settled two questions about V and two hypotheses
+about S: the 10-90 Hz scalogram fixed V (V-F1 0.8004 -> 0.9111) and S was
+shown to be limited by neither overfitting (E4) nor RR attenuation (E5).
+
+E6 attacked S where it actually lives - class exposure in the minibatch -
+and is the best run in the table, macro-F1 0.7263 argmax and 0.7372 tuned,
+with S-F1 nearly doubled. **E7 then swept the sampler ratio and found it
+saturated**: across S:N ratios 1 through 4, S recall never left the
+neighbourhood of 0.34 while S precision fell away, and validation macro-F1
+spanned only 0.0178 across the whole grid. More S exposure is not the
+remaining lever either.
+
+Taken together, step 6 and E7 rule out the two obvious knobs - reweighting
+the loss and reweighting the sampler. Both are dead ends on S recall, and
+both were established at a **cost**: they are the two rows in this table with
+no archived artefact.
 """
 
 
