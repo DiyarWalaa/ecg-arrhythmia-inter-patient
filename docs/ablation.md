@@ -47,6 +47,7 @@ DS2. All metrics below are on DS2 (inter-patient test set).
 | E6 | balanced batch sampling (1:1:1) + plain cross-entropy | `5b3b203` | 0.7263 | 0.3388 | 0.3934 | 0.3641 | 0.8503 | 0.9352 | `metrics.json` | full |
 | E7 | sampler S:N ratio sweep [1, 2, 3, 4] | `1339261` | 0.7114 | 0.3393 | 0.2789 | 0.3061 | 0.8685 | 0.9261 | **console log** | full |
 | E8 | variable-length R-1..R+1 window, 2 s cap, +mask channel | `82dd30a` | 0.6495 | 0.6594 | 0.3715 | 0.4752 | 0.5661 | 0.8410 | `metrics.json` | **span_capped_720** |
+| E9 | E6's fixed 234 window on E8's beat population (control) | `03770be` | 0.7032 | 0.3125 | 0.2841 | 0.2976 | 0.8548 | 0.9226 | `metrics.json` | **span_capped_720_fixed_window** |
 
 ## Notes
 
@@ -169,6 +170,17 @@ DS2. All metrics below are on DS2 (inter-patient test set).
 
   The window-length statistics say why S moved and why the result may not survive a fair comparison. Mean span, N against S: DS1_TRAIN 520.4 vs 407.3 (gap 113.1), DS2 524.0 vs 506.4 (gap 17.6). The prematurity cue E8 adds is far weaker in DS2 than in the data it is learned from, so part of the S gain is likely the easier population rather than the representation. **E9 is the control**: E6's fixed window scored on E8's beats.
 
+- **step E9** (`E9_e6_window_e8_population`) - train distribution N=35021 / S=637 / V=2878. Ran 14 epochs; selection on `val_macro_f1` chose **epoch 4** (best val macro-F1 0.5610); early stopping fired: True.
+  **The control for E8, and it settles what E8 measured.** E8 changed the representation AND the beat population at once. E9 holds the representation at E6's - fixed 234-sample window, 9 channels, no mask, 239,171 parameters - and keeps E8's acceptance rule. It is scored on 42,148 DS2 beats against E8's 42,154; the 6 missing beats are 5 N and 1 V, all first-of-record, and **the S class is identical at 1,565 on both sides**, so the S column compares exactly.
+
+  **On identical beats, the wide variable window is worth +0.1776 S-F1 and costs -0.2887 V-F1**: S-F1 0.2976 here against E8's 0.4752, V-F1 0.8548 against 0.5661. That is the number E8 could not report on its own.
+
+  **The population is HARDER for S, not easier.** E9's S-F1 0.2976 is BELOW E6's 0.3641 on the full DS2, even though E9 drops the 271 longest-span S beats. So none of E8's S gain came from an easier test set - the representation accounts for all of it and then some.
+
+  E9 also keeps what E8 lost: macro-F1 0.7032 against E8's 0.6495, V-F1 0.8548 against 0.5661, no V collapse. The two runs are a straight trade, S against V, at a fixed parameter count.
+
+  **A marginal exception to the threshold rule.** Tuning chose w = [1.0, 2.0, 1.4142], raising w_S ABOVE w_N for the first time in a run where the result did not get worse - macro-F1 0.7032 -> 0.7046, +0.0014. That is small enough to be noise, but the standing rule is now 3 clean confirmations and one flat case, not 4 clean confirmations.
+
 ## Test-minus-validation gap
 
 A model selected on a trustworthy validation signal should not score wildly
@@ -190,6 +202,7 @@ differently on test. The gap is `test macro-F1 - best_val_macro_f1`:
 | E6 | 0.5540 | 0.7263 | +0.1723 | `metrics.json` |
 | E7 | 0.5620 | 0.7114 | +0.1494 | **console log** |
 | E8 | 0.5090 | 0.6495 | +0.1405 | `metrics.json` |
+| E9 | 0.5610 | 0.7032 | +0.1422 | `metrics.json` |
 
 Steps 2 and 3 scored **above** validation, which is the expected direction
 when validation holds only three patients and two of them are hard. Step 4 is
@@ -244,43 +257,34 @@ no archived artefact.
 
 ## Pre-registered, NOT YET RUN
 
-**E9 - E6's window on E8's beat population.** Written and verified against
-the real records, but not trained: no row above and no `results/` folder.
+**E10 - fixed-window width sweep.** Written and verified against the real
+records, not yet trained.
 
-E8 is the best run on S by a wide margin and one of the worse runs overall,
-and it changed TWO things at once - the representation and the beat
-population. E9 holds the representation at E6's (fixed 234-sample window, 9
-wavelet channels, no mask, 239,171 parameters, sampler 1:1:1, plain
-cross-entropy) and borrows only E8's ACCEPTANCE RULE: keep a beat if the
-span between its neighbouring R peaks is at most 720 samples.
+E8 and E9 differ in two ways: how much CONTEXT the model sees, and whether an
+explicit LENGTH SIGNAL exists (E8's mask channel encodes the R-1..R+1 span).
+A fixed wide window has the context and no length signal, so sweeping the
+fixed width separates them. Widths swept, each keeping E9's 0.385/0.615
+pre/post split: **234 (E9's control), 360, 480, 600**. Selection is on best
+val macro-F1 over DS1_VAL.
 
-Verified on all 44 records before running - the span-cap rejections
-reproduce E8's exactly (DS1_TRAIN 5280/33/227, DS1_VAL 179/0/81, DS2
-6838/271/32):
+**All four arms train and test on IDENTICAL beats.** Acceptance is decided
+once, by the span cap plus the LARGEST window in the grid, and applied to
+every arm regardless of the width it reads. Verified on all 44 records: the
+four arms return byte-identical labels and RR features, and per-class counts
+agree exactly.
 
-| split | E9 accepted | E8 accepted | difference |
+| split | E9 | E10 | cost |
 |---|---|---|---|
-| DS1_TRAIN | 35021 / 637 / 2878 | 35025 / 637 / 2878 | -4 N |
-| DS1_VAL | 5359 / 273 / 602 | 5361 / 273 / 602 | -2 N |
-| DS2 | 37395 / 1565 / 3188 | 37400 / 1565 / 3189 | -5 N, -1 V |
+| DS1_TRAIN | 35021 / 637 / 2878 | 35006 / 637 / 2877 | -15 N, -1 V |
+| DS1_VAL | 5359 / 273 / 602 | 5358 / 273 / 602 | -1 N |
+| DS2 | 37395 / 1565 / 3188 | **37377 / 1565 / 3187** | -18 N, -1 V |
 
-**E9 is scored on 42,148 DS2 beats against E8's 42,154.** The 6 excluded
-beats are 5 N and 1 V, every one the first annotated beat of its record,
-where the R peak sits 28-88 samples in so E6's `r - 90` window starts before
-sample 0 and there is no signal to read. E8's `R-1..R+1` window did not have
-that problem. **The S class is identical on both sides at 1,565 beats**, so
-every S metric is exactly comparable; N recall can move by at most 1.3e-4
-and V recall by at most 3.1e-4, bounding macro-F1 incomparability below
-2e-4 against an E8-vs-E6 effect size of 0.08 - roughly 400x smaller than
-what is being measured. Stated so the comparison is precise rather than
-approximate.
+The wider acceptance window costs 36 beats in total - 34 N and 2 V - and
+**no S beat at any stage**. S has been 1,565 in DS2 for E8, E9 and E10
+alike, so the S column is exactly comparable across all three.
 
-Re-running E8 with the fixed-window edge rule would spend a full run
-removing an uncertainty 400x below the effect; left-padding the window at
-the record start would fabricate a signal pattern the model sees nowhere
-else. Both are worse than the 6-beat gap.
-
-**What E9 decides.** If it recovers most of E8's S gain (S-F1 0.4752, S
-recall 0.6594 against E6's 0.3641 and 0.3388), the gain was the easier
-population and the variable-length representation is not doing the work. If
-it stays near E6, the representation is.
+**What E10 decides.** If a wide FIXED window recovers most of E8's S gain
+(S-F1 0.4752 against E9's 0.2976), context is what matters and E8's mask
+channel is incidental. If the fixed arms all sit near E9's 0.2976 however
+wide they get, the explicit length signal is doing the work and the mask
+channel is the finding.

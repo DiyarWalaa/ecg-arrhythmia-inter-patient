@@ -272,6 +272,51 @@ SAMPLING_RATE_HZ = 360.0
 # If it does not, the gain was the representation.
 MAX_SPAN_SAMPLES = int(2.0 * SAMPLING_RATE_HZ)
 
+# E10: FIXED-WINDOW WIDTH SWEEP.
+#
+# On IDENTICAL beats, E8 (720-sample variable window plus a mask channel
+# encoding the R-1..R+1 span) reached S-F1 0.4752 and V-F1 0.5661; E9
+# (E6's fixed 234-sample window) reached 0.2976 and 0.8548. The wide
+# window is worth +0.1776 S-F1 and costs -0.2887 V-F1.
+#
+# But E8 and E9 differ in TWO ways: how much CONTEXT the model sees, and
+# whether an explicit LENGTH SIGNAL exists. A fixed wide window has the
+# context and no length signal, so sweeping the fixed width separates
+# them. If a wide fixed window recovers E8's S gain, context is what
+# matters and the mask channel is incidental; if it does not, the length
+# signal is doing the work.
+#
+# Each pair keeps E9's 0.385 / 0.615 pre/post split of the total width.
+# The span cap is NOT lowered: DS1_TRAIN S beats average 407 samples and
+# DS2 S beats 506, so a 400-500 cap would reject most of the S class.
+WINDOW_GRID = [
+    (90, 144),      # 234 - E9's window, the control arm
+    (140, 220),     # 360
+    (185, 295),     # 480
+    (230, 370),     # 600
+]
+
+# POPULATION CONTROL.
+#
+# Every arm must train and test on IDENTICAL beats, otherwise a width
+# difference and a population difference are confounded - which is exactly
+# the mistake E8 made and E9 had to unpick. So acceptance is decided ONCE,
+# by the LARGEST window in the grid, and applied to every arm regardless
+# of the width that arm actually reads. A beat is kept only if it clears
+# both the span cap and the largest window's bounds.
+ACCEPT_PRE = max(pre for pre, _post in WINDOW_GRID)
+ACCEPT_POST = max(post for _pre, post in WINDOW_GRID)
+
+# The grid is monotone, so the widest pre and the widest post come from
+# the same pair. If that ever stops being true the acceptance window would
+# be wider than any arm actually trains on, which would silently drop
+# beats no arm needed dropped.
+assert (ACCEPT_PRE, ACCEPT_POST) in WINDOW_GRID, (
+    "the widest pre and post must come from the same grid entry"
+)
+
+WINDOW_WIDTHS = [pre + post for pre, post in WINDOW_GRID]
+
 WAVELET_TARGET_FREQS_HZ = [float(10 * k) for k in range(1, 10)]
 
 # Patient-relative RR features (step 3).
@@ -526,7 +571,7 @@ print(f"  {'target Hz':>10} {'width a':>10} {'centre Hz':>10} "
 for _f, _a, _c in zip(WAVELET_TARGET_FREQS_HZ, WAVELET_WIDTHS,
                       WAVELET_CENTRE_FREQS_HZ):
     print(f"  {_f:>10.1f} {_a:>10.4f} {_c:>10.4f} "
-          f"{int(min(10.0 * _a, SEGMENT_LENGTH)):>8}")
+          f"{int(min(10.0 * _a, max(WINDOW_WIDTHS))):>8}")
 
 
 # =========================================================
@@ -540,7 +585,7 @@ def empty_segmentation_stats():
     whose symbol is in AAMI_MAP, so they always reconcile against the
     total. `spans` holds the accepted R-1..R+1 span lengths, which is what
     the per-class mean and standard deviation are computed from - the
-    window the MODEL sees is a fixed SEGMENT_LENGTH regardless.
+    window the MODEL sees is this arm's (pre + post) regardless.
     """
 
     labels = sorted(set(AAMI_MAP.values()))
@@ -550,7 +595,7 @@ def empty_segmentation_stats():
         "rejected_max_span": {lab: 0 for lab in labels},
         "rejected_edge": {lab: 0 for lab in labels},
         "rejected_invalid_span": {lab: 0 for lab in labels},
-        "rejected_fixed_window": {lab: 0 for lab in labels},
+        "rejected_accept_window": {lab: 0 for lab in labels},
         "spans": {lab: [] for lab in labels}
     }
 
@@ -559,7 +604,7 @@ def merge_segmentation_stats(into, other):
     """Accumulate one record's stats into a running total."""
 
     for key in ("accepted", "rejected_max_span", "rejected_edge",
-                "rejected_invalid_span", "rejected_fixed_window"):
+                "rejected_invalid_span", "rejected_accept_window"):
         for lab, count in other[key].items():
             into[key][lab] += count
 
@@ -583,7 +628,7 @@ def summarize_segmentation_stats(stats):
             "rejected_max_span": int(stats["rejected_max_span"][lab]),
             "rejected_edge": int(stats["rejected_edge"][lab]),
             "rejected_invalid_span": int(stats["rejected_invalid_span"][lab]),
-            "rejected_fixed_window": int(stats["rejected_fixed_window"][lab]),
+            "rejected_accept_window": int(stats["rejected_accept_window"][lab]),
             "span_mean": float(spans.mean()) if spans.size else None,
             "span_std": float(spans.std()) if spans.size else None,
             "span_min": int(spans.min()) if spans.size else None,
@@ -594,7 +639,7 @@ def summarize_segmentation_stats(stats):
                  + out[lab]["rejected_max_span"]
                  + out[lab]["rejected_edge"]
                  + out[lab]["rejected_invalid_span"]
-                 + out[lab]["rejected_fixed_window"])
+                 + out[lab]["rejected_accept_window"])
 
         out[lab]["total_annotated"] = int(total)
 
@@ -612,12 +657,16 @@ def extract_beats_from_record(
     post_samples,
     lead_index=0
 ):
-    """E6's fixed window, restricted to E8's beat population.
+    """A fixed (pre_samples + post_samples) window on a fixed population.
 
     Returns (beats, labels, rr_features, raw_beats, stats). Each beat is
-    (SEGMENT_LENGTH, N_WAVELET_SCALES) - exactly what E6 produced. The
-    R-1..R+1 span is computed only to decide ACCEPTANCE; it never reaches
-    the model.
+    (pre_samples + post_samples, N_WAVELET_SCALES).
+
+    ACCEPTANCE is independent of this arm's width: a beat is kept only if
+    its R-1..R+1 span clears MAX_SPAN_SAMPLES and the LARGEST window in
+    WINDOW_GRID fits inside the record. So `labels` and `rr_features` are
+    identical for every window in the grid, and only `beats` differs -
+    which is what makes the sweep a clean single-variable comparison.
     """
 
     record_path = os.path.join(
@@ -700,25 +749,28 @@ def extract_beats_from_record(
             stats["rejected_max_span"][label] += 1
             continue
 
-        # --- E6's FIXED WINDOW, unchanged -------------------------------
+        # --- ACCEPTANCE WINDOW: always the LARGEST in WINDOW_GRID -------
+        #
+        # Decided by ACCEPT_PRE/ACCEPT_POST, never by this arm's width, so
+        # every arm sees the same beats. A beat the widest window cannot
+        # read is dropped from ALL arms, including the narrow ones that
+        # could have read it.
+        if (r_peak - ACCEPT_PRE) < 0 or (r_peak + ACCEPT_POST) > len(signal):
+            stats["rejected_accept_window"][label] += 1
+            continue
+
+        # --- THIS ARM'S WINDOW: what the model actually reads ------------
         start = r_peak - pre_samples
         end = r_peak + post_samples
 
-        # E8's window was R-1..R+1, which is in bounds wherever the span
-        # rule above passed. The fixed window is not: 12 beats across the
-        # database are the FIRST annotated beat of their record, with the
-        # R peak 28-88 samples in, so r - pre_samples < 0 and there is no
-        # signal to read. Those 12 (4 N in DS1_TRAIN, 2 N in DS1_VAL,
-        # 5 N + 1 V in DS2, and no S anywhere) are in E8's population and
-        # cannot be in E9's. Counted separately so the gap is explicit.
-        if start < 0 or end > len(signal):
-            stats["rejected_fixed_window"][label] += 1
-            continue
-
         segment = signal[start:end]
 
-        if len(segment) != SEGMENT_LENGTH:
-            stats["rejected_fixed_window"][label] += 1
+        # Guaranteed by the acceptance test above for every grid entry,
+        # since pre <= ACCEPT_PRE and post <= ACCEPT_POST. Kept as a guard
+        # against a future grid whose widest entry is not the acceptance
+        # window.
+        if len(segment) != (pre_samples + post_samples):
+            stats["rejected_accept_window"][label] += 1
             continue
 
         pre_rr = float(rr_series[i - 1])
@@ -760,7 +812,7 @@ def extract_beats_from_record(
 
         raw_beats.append(segment.astype(np.float32))
 
-        # (SEGMENT_LENGTH,) -> (SEGMENT_LENGTH, N_WAVELET_SCALES)
+        # (pre + post,) -> (pre + post, N_WAVELET_SCALES)
         segment = cwt_ricker(
             segment,
             WAVELET_WIDTHS
@@ -1153,16 +1205,29 @@ def tune_decision_weights(y_prob, y_true_int, num_classes, grid,
 
 
 # =========================================================
-# 12. LOAD TRAIN / TEST
+# 12. LOAD DS1 ONLY  (DS2 is not read until after selection)
 # =========================================================
 
-print("Loading DS1_TRAIN (train) ...")
+# E10 sweeps the window width, so the beats have to be re-extracted per
+# arm. Only DS1 is loaded here, at the CONTROL window; each sweep arm
+# re-extracts DS1 at its own width in section 22.
+#
+# DS2 IS NOT LOADED IN THIS FILE UNTIL SECTION 23B, which runs AFTER the
+# winning window has been chosen on validation. That is a stronger
+# guarantee than the BETA and sampler sweeps had: those kept X_test in
+# memory throughout and relied on the loop not referring to it, whereas
+# here the DS2 arrays do not exist while any selection decision is made.
+
+CONTROL_PRE, CONTROL_POST = WINDOW_GRID[0]
+
+print(f"Loading DS1_TRAIN (train) at the control window "
+      f"({CONTROL_PRE}, {CONTROL_POST}) ...")
 
 X_train, y_train, RR_train, X_raw_train, SEG_STATS_TRAIN = load_dataset(
     DS1_TRAIN,
     DATA_DIR,
-    PRE_SAMPLES,
-    POST_SAMPLES,
+    CONTROL_PRE,
+    CONTROL_POST,
     LEAD_INDEX
 )
 
@@ -1185,8 +1250,8 @@ for rec in DS1_VAL:
     X_rec, y_rec, RR_rec, _, _rec_stats = load_dataset(
         [rec],
         DATA_DIR,
-        PRE_SAMPLES,
-        POST_SAMPLES,
+        CONTROL_PRE,
+        CONTROL_POST,
         LEAD_INDEX
     )
 
@@ -1204,19 +1269,10 @@ RR_valid = np.concatenate(RR_valid_parts, axis=0)
 
 val_record_ids = np.array(val_record_ids)
 
-print("\nLoading DS2 (test) ...")
-
-X_test, y_test, RR_test, _, SEG_STATS_TEST = load_dataset(
-    DS2,
-    DATA_DIR,
-    PRE_SAMPLES,
-    POST_SAMPLES,
-    LEAD_INDEX
-)
+del X_valid_parts, y_valid_parts, RR_valid_parts
 
 print("\nTrain shape:", X_train.shape)
 print("Val shape  :", X_valid.shape)
-print("Test shape :", X_test.shape)
 
 print(f"\nDS1_TRAIN records ({len(DS1_TRAIN)}): {DS1_TRAIN}")
 print("Original Train Distribution:")
@@ -1226,97 +1282,98 @@ print(f"\nDS1_VAL records ({len(DS1_VAL)}): {DS1_VAL}")
 print("Original Validation Distribution:")
 print(Counter(y_valid))
 
-print("\nOriginal Test Distribution:")
-print(Counter(y_test))
+
+# Untouched references for the sweep. Acceptance does not depend on the
+# window width, so every arm must return byte-identical labels and RR
+# features; only the beats differ. These copies are what section 22
+# asserts against, taken BEFORE section 15 standardises RR in place.
+Y_TRAIN_REF = y_train.copy()
+Y_VALID_REF = y_valid.copy()
+RR_TRAIN_RAW = RR_train.copy()
+RR_VALID_RAW = RR_valid.copy()
 
 
-# --- E9 population accounting -------------------------------------------
+# --- E10 population accounting ------------------------------------------
 #
-# E9 exists to score E6's representation on E8's beats, so the population
-# has to be shown, not asserted in a commit message.
-#
-# `rejected_max_span` is E8's 2-second cap, reproduced exactly.
-# `rejected_fixed_window` is the residual E9 cannot avoid: 12 beats across
-# the database are the first annotated beat of their record, with the R
-# peak 28-88 samples in, so E6's r-90 window starts before sample 0. E8's
-# R-1..R+1 window did not, so E8 has them and E9 cannot. None is an S
-# beat.
+# Acceptance is the LARGEST window in the grid plus the span cap, applied
+# once and shared by every arm. That is strictly stricter than E9's rule,
+# which only had to fit a 234-sample window, so E10 scores fewer beats
+# than E9 - and the cost is reported here rather than discovered later.
 
 SEGMENTATION_STATS = {
     "DS1_TRAIN": summarize_segmentation_stats(SEG_STATS_TRAIN),
-    "DS1_VAL": summarize_segmentation_stats(SEG_STATS_VAL),
-    "DS2": summarize_segmentation_stats(SEG_STATS_TEST)
+    "DS1_VAL": summarize_segmentation_stats(SEG_STATS_VAL)
 }
 
-# The population E8 reached, from results/E8_variable_segmentation.
-E8_ACCEPTED = {
-    "DS1_TRAIN": {"N": 35025, "S": 637, "V": 2878},
-    "DS1_VAL": {"N": 5361, "S": 273, "V": 602},
-    "DS2": {"N": 37400, "S": 1565, "V": 3189}
-}
-
-# What E9 must reach: E8's population minus the 12 unreachable beats.
-E9_EXPECTED = {
+# E9's population, from results/E9_e6_window_e8_population/metrics.json.
+E9_ACCEPTED = {
     "DS1_TRAIN": {"N": 35021, "S": 637, "V": 2878},
     "DS1_VAL": {"N": 5359, "S": 273, "V": 602},
     "DS2": {"N": 37395, "S": 1565, "V": 3188}
 }
 
+# Measured on all 44 records before the run, with the real extraction
+# code. The wider acceptance window costs 17 DS1 beats and 19 DS2 beats
+# relative to E9 - 34 N and 2 V in total, and NO S beats in any split, so
+# the S class is identical to E9's at 637 / 273 / 1565.
+E10_EXPECTED = {
+    "DS1_TRAIN": {"N": 35006, "S": 637, "V": 2877},
+    "DS1_VAL": {"N": 5358, "S": 273, "V": 602},
+    "DS2": {"N": 37377, "S": 1565, "V": 3187}
+}
+
 print("\n" + "=" * 78)
-print("E9 POPULATION: E6's fixed window, E8's acceptance rule")
-print(f"  model sees a FIXED {SEGMENT_LENGTH}-sample window at "
-      f"{N_WAVELET_SCALES} wavelet channels; the R-1..R+1 span "
-      f"(cap {MAX_SPAN_SAMPLES}) only decides inclusion")
+print("E10 POPULATION: span cap + the LARGEST window in the grid")
+print(f"  acceptance window ({ACCEPT_PRE}, {ACCEPT_POST}) = "
+      f"{ACCEPT_PRE + ACCEPT_POST} samples, span cap {MAX_SPAN_SAMPLES}")
+print(f"  widths swept: {WINDOW_WIDTHS}")
 print("=" * 78)
-print(f"  {'split':<10} {'cls':>3} {'annot':>7} {'accept':>7} {'E8':>7} "
-      f"{'diff':>5} {'>cap':>6} {'fixwin':>7} {'edge':>5} "
-      f"{'span mean':>10} {'span std':>9}")
+print(f"  {'split':<10} {'cls':>3} {'annot':>7} {'accept':>7} {'E9':>7} "
+      f"{'diff':>6} {'>cap':>6} {'window':>7} {'edge':>5} "
+      f"{'span mean':>10}")
 
 for _split, _block in SEGMENTATION_STATS.items():
     for _lab, _row in _block.items():
         _mean = _row["span_mean"]
-        _std = _row["span_std"]
-        _e8 = E8_ACCEPTED[_split][_lab]
+        _e9 = E9_ACCEPTED[_split][_lab]
         print(f"  {_split:<10} {_lab:>3} {_row['total_annotated']:>7} "
-              f"{_row['accepted']:>7} {_e8:>7} "
-              f"{_row['accepted'] - _e8:>5} "
+              f"{_row['accepted']:>7} {_e9:>7} "
+              f"{_row['accepted'] - _e9:>6} "
               f"{_row['rejected_max_span']:>6} "
-              f"{_row['rejected_fixed_window']:>7} "
+              f"{_row['rejected_accept_window']:>7} "
               f"{_row['rejected_edge']:>5} "
-              f"{_mean if _mean is None else round(_mean, 1):>10} "
-              f"{_std if _std is None else round(_std, 1):>9}")
+              f"{_mean if _mean is None else round(_mean, 1):>10}")
 
-# Hard stop if the population is not the one E9 is defined to score. A
-# silent mismatch here would make the whole comparison meaningless.
-_pop_errors = []
-
-for _split, _block in SEGMENTATION_STATS.items():
-    for _lab, _row in _block.items():
-        _want = E9_EXPECTED[_split][_lab]
-        if _row["accepted"] != _want:
-            _pop_errors.append(
-                f"{_split}/{_lab}: accepted {_row['accepted']}, "
-                f"expected {_want}")
-
-assert not _pop_errors, (
-    "E9 is not reproducing E8's beat population: "
-    + "; ".join(_pop_errors)
-)
-
-# And the stats must agree with what actually landed in the arrays.
+# The stats must agree with what actually landed in the arrays.
 for _split, _block, _y in (("DS1_TRAIN", SEGMENTATION_STATS["DS1_TRAIN"], y_train),
-                           ("DS1_VAL", SEGMENTATION_STATS["DS1_VAL"], y_valid),
-                           ("DS2", SEGMENTATION_STATS["DS2"], y_test)):
+                           ("DS1_VAL", SEGMENTATION_STATS["DS1_VAL"], y_valid)):
     _counter = Counter(_y)
     for _lab, _row in _block.items():
         assert _row["accepted"] == _counter.get(_lab, 0), (
             f"{_split}/{_lab}: stats say {_row['accepted']} accepted but "
             f"the array holds {_counter.get(_lab, 0)}")
 
-print("\n  population matches E8 exactly except for "
-      f"{sum(E8_ACCEPTED[sp][lb] - E9_EXPECTED[sp][lb] for sp in E8_ACCEPTED for lb in ('N', 'S', 'V'))} "
-      "unreachable first-of-record beats (0 of them S)")
+_pop_errors = []
 
+for _split in ("DS1_TRAIN", "DS1_VAL"):
+    for _lab, _row in SEGMENTATION_STATS[_split].items():
+        _want = E10_EXPECTED[_split][_lab]
+        if _row["accepted"] != _want:
+            _pop_errors.append(
+                f"{_split}/{_lab}: accepted {_row['accepted']}, "
+                f"expected {_want}")
+
+assert not _pop_errors, (
+    "E10's shared acceptance rule is not producing the measured "
+    "population: " + "; ".join(_pop_errors)
+)
+
+_cost_ds1 = sum(
+    E9_ACCEPTED[sp][lb] - SEGMENTATION_STATS[sp][lb]["accepted"]
+    for sp in ("DS1_TRAIN", "DS1_VAL") for lb in ("N", "S", "V"))
+
+print(f"\n  the wider acceptance window costs {_cost_ds1} DS1 beats "
+      f"relative to E9")
 
 
 # =========================================================
@@ -1362,10 +1419,7 @@ y_valid_encoded = np.array([
     for label in y_valid
 ], dtype=np.int32)
 
-y_test_encoded = np.array([
-    LABEL_TO_INT[label]
-    for label in y_test
-], dtype=np.int32)
+# y_test_encoded is built in section 23B, after the window is selected.
 
 
 # =========================================================
@@ -1402,7 +1456,11 @@ print(f"  std  (prev_rr, next_rr): {RR_NORM_STD.tolist()}")
 
 RR_train = apply_rr_norm(RR_train, RR_NORM_MEAN, RR_NORM_STD)
 RR_valid = apply_rr_norm(RR_valid, RR_NORM_MEAN, RR_NORM_STD)
-RR_test = apply_rr_norm(RR_test, RR_NORM_MEAN, RR_NORM_STD)
+
+# RR_test is normalised in section 23B with these same DS1_TRAIN
+# statistics. The RR features do not depend on the window width - they are
+# built from the annotation samples - so they are identical for every arm
+# and these statistics are fitted exactly once.
 
 
 # =========================================================
@@ -1410,18 +1468,31 @@ RR_test = apply_rr_norm(RR_test, RR_NORM_MEAN, RR_NORM_STD)
 # =========================================================
 
 # No expand_dims any more. Beats leave section 7 already shaped
-# (SEGMENT_LENGTH, N_WAVELET_SCALES), so the Conv1D channel axis is the
+# (pre + post, N_WAVELET_SCALES), so the Conv1D channel axis is the
 # wavelet scale axis. build_model() takes its input shape from the data,
-# so the branch widens from 1 to 9 channels without a code change.
+# so a sweep arm's width flows through without a code change - and because
+# every parameter count in the network depends on CHANNELS and not on
+# sequence length, all four arms have identical parameter counts.
 
-for _name, _arr in (("train", X_train), ("valid", X_valid),
-                    ("test", X_test)):
-    assert _arr.ndim == 3, f"{_name}: expected 3 dims, got {_arr.shape}"
-    assert _arr.shape[1] == SEGMENT_LENGTH, f"{_name}: {_arr.shape}"
-    assert _arr.shape[2] == N_WAVELET_SCALES, f"{_name}: {_arr.shape}"
+def assert_cnn_input(arrays, expected_length):
+    """Shape guard, reused for every sweep arm and for DS2 in 23B."""
+
+    for _name, _arr in arrays:
+        assert _arr.ndim == 3, f"{_name}: expected 3 dims, got {_arr.shape}"
+        assert _arr.shape[1] == expected_length, \
+            f"{_name}: expected length {expected_length}, got {_arr.shape}"
+        assert _arr.shape[2] == N_WAVELET_SCALES, f"{_name}: {_arr.shape}"
+        assert _arr.dtype == np.float32, f"{_name}: {_arr.dtype}"
+        assert np.all(np.isfinite(_arr)), f"{_name}: non-finite values"
+
+
+assert_cnn_input(
+    (("train", X_train), ("valid", X_valid)),
+    CONTROL_PRE + CONTROL_POST
+)
 
 print(f"\nCNN input shapes  train {X_train.shape}  "
-      f"valid {X_valid.shape}  test {X_test.shape}")
+      f"valid {X_valid.shape}   (control window)")
 
 
 # =========================================================
@@ -1481,10 +1552,7 @@ y_val_cat = tf.keras.utils.to_categorical(
     num_classes=NUM_CLASSES
 )
 
-y_test_cat = tf.keras.utils.to_categorical(
-    y_test_encoded,
-    num_classes=NUM_CLASSES
-)
+# y_test_cat is built in section 23B, after the window is selected.
 
 
 # =========================================================
@@ -1504,22 +1572,17 @@ y_test_cat = tf.keras.utils.to_categorical(
 
 SAMPLER = "balanced_batch"
 
-# E9 holds the sampler at E6's 1:1:1 and changes only which beats exist.
+# E10 holds the sampler at E6's 1:1:1. E7 swept the ratio over [1, 2, 3, 4]
+# and found it SATURATED: S recall moved +0.0005 between ratio 1 and ratio
+# 2 while S precision fell 0.3934 -> 0.2789, and validation macro-F1
+# spanned only 0.0178 across the whole grid. That question is settled, and
+# the sweep in section 22 is over the WINDOW WIDTH instead.
 #
-# E7 swept this grid over [1, 2, 3, 4] and found it SATURATED: S recall
-# moved +0.0005 between ratio 1 and ratio 2 while S precision fell
-# 0.3934 -> 0.2789, and validation macro-F1 spanned only 0.0178 across the
-# whole grid. That question is settled, so the grid is a single point.
 # Ratio 1.0 gives weights [1/3, 1/3, 1/3] - exactly E6's sampler, and E7's
 # ratio-1.0 arm reproduced E6's selection (0.5540 at epoch 6) exactly.
-#
-# The sweep machinery is left in place rather than deleted so the
-# selection path, the seed reset and the metrics.json shape are unchanged;
-# with one entry it simply trains one model.
-#
-# A ratio r means S is drawn r times as often as each of N and V:
-# weights proportional to [1, r, 1], normalised.
-SAMPLER_RATIO_GRID = [1.0]
+SAMPLER_RATIO = 1.0
+
+SAMPLING_WEIGHTS = weights_for_ratio(SAMPLER_RATIO)
 
 STEPS_PER_EPOCH = int(np.ceil(len(y_tr_aug) / BATCH_SIZE))
 
@@ -1580,15 +1643,11 @@ for _class_index in range(NUM_CLASSES):
     print(f"  sampler class {INT_TO_LABEL[_class_index]}: "
           f"{int((y_tr_aug == _class_index).sum())} real beats")
 
-print(f"\nSampler ratio grid {SAMPLER_RATIO_GRID}, batch {BATCH_SIZE}, "
+print(f"\nSampler ratio {SAMPLER_RATIO} (fixed), batch {BATCH_SIZE}, "
       f"{STEPS_PER_EPOCH} steps/epoch "
       f"({len(y_tr_aug)} training beats / {BATCH_SIZE})")
-print(f"  {'ratio':>6}  {'weights [N, S, V]':<34} {'sum':>8}")
-
-for _ratio in SAMPLER_RATIO_GRID:
-    _w = weights_for_ratio(_ratio)
-    print(f"  {_ratio:>6.1f}  {[round(v, 6) for v in _w]!s:<34} "
-          f"{sum(_w):>8.4f}")
+print(f"  weights [N, S, V] = {[round(v, 6) for v in SAMPLING_WEIGHTS]}, "
+      f"sum {sum(SAMPLING_WEIGHTS):.4f}")
 
 
 # =========================================================
@@ -1747,7 +1806,8 @@ def build_model(ecg_shape, rr_shape):
 # The model is NOT built here any more. Section 22 builds one per ratio
 # in the sweep and keeps the one validation selects.
 
-ECG_INPUT_SHAPE = X_tr_aug.shape[1:]
+# No ECG_INPUT_SHAPE constant any more: the sweep in section 22 builds one
+# model per window and takes the shape from that arm's own array.
 RR_INPUT_SHAPE = (len(RR_FEATURE_NAMES),)
 
 
@@ -1877,50 +1937,141 @@ def make_callbacks():
 
 
 # =========================================================
-# 22. TRAIN MODEL - SAMPLER RATIO SWEEP, SELECTED ON VALIDATION
+# 22. TRAIN MODEL - FIXED-WINDOW WIDTH SWEEP, SELECTED ON VALIDATION
 # =========================================================
 
-# One model per ratio, each from an identical seed reset. Selection is on
-# best val macro-F1 over DS1_VAL.
+# One model per window width, each from an identical seed reset and a
+# fresh build_model(). Selection is on best val macro-F1 over DS1_VAL.
 #
-# THE TEST SET IS NOT TOUCHED IN THIS LOOP. No X_test / RR_test /
-# y_test_encoded appears below; DS2 is evaluated exactly once, in section
-# 24, on whichever model this loop selects.
+# THE TEST SET IS NOT TOUCHED IN THIS LOOP - and this time that is
+# structural, not a promise. DS2 has not been READ yet: X_test, RR_test,
+# y_test_encoded and y_test_cat do not exist as names until section 23B,
+# which runs after SELECTED_WINDOW is fixed. The BETA and sampler sweeps
+# kept DS2 in memory throughout and relied on the loop not mentioning it;
+# here there is nothing to mention.
+#
+# Every arm draws from the SAME beats: acceptance was decided once, in
+# section 7, by the largest window in the grid. The asserts below refuse
+# to train if any arm's labels or RR features differ from the control's.
 
-SAMPLER_SWEEP = []
+WINDOW_SWEEP = []
+PARAM_COUNTS = {}
 
 model = None
 history = None
 val_metrics_cb = None
 early_stopping = None
 
-SELECTED_RATIO = None
-SAMPLING_WEIGHTS = None
+SELECTED_WINDOW = None
+SELECTED_INPUT_LENGTH = None
 BEST_SWEEP_VAL = None
 
-for sweep_ratio in SAMPLER_RATIO_GRID:
+best_X_tr = None
+best_X_val = None
 
-    sweep_weights = weights_for_ratio(sweep_ratio)
+
+def load_ds1_for_window(pre, post):
+    """DS1_TRAIN and DS1_VAL beats at one window width.
+
+    Labels and RR features are checked byte-identical to the control
+    arm's - if they are not, the arms are not scoring the same beats and
+    the sweep would confound width with population.
+    """
+
+    X_tr_w, y_tr_w, RR_tr_w, _raw, _st = load_dataset(
+        DS1_TRAIN,
+        DATA_DIR,
+        pre,
+        post,
+        LEAD_INDEX
+    )
+
+    assert np.array_equal(y_tr_w, Y_TRAIN_REF), (
+        f"window ({pre},{post}): DS1_TRAIN labels differ from the control"
+    )
+    assert np.array_equal(RR_tr_w, RR_TRAIN_RAW), (
+        f"window ({pre},{post}): DS1_TRAIN RR features differ from the "
+        f"control"
+    )
+
+    val_parts = []
+    y_val_parts = []
+    RR_val_parts = []
+
+    for rec in DS1_VAL:
+
+        X_rec_w, y_rec_w, RR_rec_w, _r, _s = load_dataset(
+            [rec],
+            DATA_DIR,
+            pre,
+            post,
+            LEAD_INDEX
+        )
+
+        val_parts.append(X_rec_w)
+        y_val_parts.append(y_rec_w)
+        RR_val_parts.append(RR_rec_w)
+
+    X_val_w = np.concatenate(val_parts, axis=0)
+
+    assert np.array_equal(np.concatenate(y_val_parts, axis=0), Y_VALID_REF), (
+        f"window ({pre},{post}): DS1_VAL labels differ from the control"
+    )
+    assert np.array_equal(np.concatenate(RR_val_parts, axis=0),
+                          RR_VALID_RAW), (
+        f"window ({pre},{post}): DS1_VAL RR features differ from the control"
+    )
+
+    return X_tr_w, X_val_w
+
+
+for sweep_pre, sweep_post in WINDOW_GRID:
+
+    sweep_width = sweep_pre + sweep_post
 
     print("\n" + "=" * 60)
-    print(f"SWEEP: sampler ratio {sweep_ratio} -> weights "
-          f"{[round(v, 6) for v in sweep_weights]}")
+    print(f"SWEEP: window ({sweep_pre}, {sweep_post}) -> {sweep_width} "
+          f"samples")
     print("=" * 60)
 
-    # Identical initialisation for every ratio, so any difference in val
-    # macro-F1 is attributable to the ratio and not to weight init.
+    if (sweep_pre, sweep_post) == (CONTROL_PRE, CONTROL_POST):
+        # Already loaded in section 12; do not pay for it twice.
+        X_tr_sweep = X_train
+        X_val_sweep = X_valid
+    else:
+        X_tr_sweep, X_val_sweep = load_ds1_for_window(sweep_pre, sweep_post)
+
+    assert_cnn_input(
+        (("train", X_tr_sweep), ("valid", X_val_sweep)),
+        sweep_width
+    )
+
+    # The helpers close over these module-level names, so rebinding them
+    # is what points the sampler and the callbacks at this arm's beats.
+    # RR_tr_aug, y_tr_aug_cat, RR_val and y_val are window-independent and
+    # are deliberately NOT rebound.
+    X_tr_aug = X_tr_sweep
+    X_val = X_val_sweep
+
+    # Identical initialisation for every width, so any difference in val
+    # macro-F1 is attributable to the width and not to weight init.
     reset_seeds()
 
-    sweep_dataset = make_balanced_dataset(sweep_weights)
+    sweep_dataset = make_balanced_dataset(SAMPLING_WEIGHTS)
 
     sweep_callbacks, sweep_val_cb, sweep_early = make_callbacks()
 
     sweep_model = build_model(
-        ecg_shape=ECG_INPUT_SHAPE,
+        ecg_shape=X_tr_sweep.shape[1:],
         rr_shape=RR_INPUT_SHAPE
     )
 
-    if sweep_ratio == SAMPLER_RATIO_GRID[0]:
+    PARAM_COUNTS[sweep_width] = int(sweep_model.count_params())
+
+    print(f"  input shape {X_tr_sweep.shape[1:]}, "
+          f"{PARAM_COUNTS[sweep_width]:,} parameters")
+
+    if (sweep_pre, sweep_post) == WINDOW_GRID[0]:
         sweep_model.summary()
 
     sweep_history = sweep_model.fit(
@@ -1953,9 +2104,11 @@ for sweep_ratio in SAMPLER_RATIO_GRID:
         sweep_best = float("-inf")
         sweep_best_epoch = None
 
-    SAMPLER_SWEEP.append({
-        "ratio": float(sweep_ratio),
-        "weights": [float(v) for v in sweep_weights],
+    WINDOW_SWEEP.append({
+        "pre": int(sweep_pre),
+        "post": int(sweep_post),
+        "input_length": int(sweep_width),
+        "total_parameters": PARAM_COUNTS[sweep_width],
         "best_val_macro_f1": sweep_best,
         "best_epoch": sweep_best_epoch,
         "epochs_run": len(sweep_curve),
@@ -1963,14 +2116,18 @@ for sweep_ratio in SAMPLER_RATIO_GRID:
         "val_macro_f1_curve": sweep_curve
     })
 
-    print(f"\n  ratio {sweep_ratio}: best val macro-F1 {sweep_best:.4f} "
+    print(f"\n  window {sweep_width}: best val macro-F1 {sweep_best:.4f} "
           f"at epoch {sweep_best_epoch} of {len(sweep_curve)}")
 
     if BEST_SWEEP_VAL is None or sweep_best > BEST_SWEEP_VAL:
 
         BEST_SWEEP_VAL = sweep_best
-        SELECTED_RATIO = float(sweep_ratio)
-        SAMPLING_WEIGHTS = [float(v) for v in sweep_weights]
+        SELECTED_WINDOW = (int(sweep_pre), int(sweep_post))
+        SELECTED_INPUT_LENGTH = int(sweep_width)
+
+        # Rebinding drops the previous winner's arrays.
+        best_X_tr = X_tr_sweep
+        best_X_val = X_val_sweep
 
         # Keep this run's objects; sections 22B onward use these names.
         model = sweep_model
@@ -1978,30 +2135,65 @@ for sweep_ratio in SAMPLER_RATIO_GRID:
         val_metrics_cb = sweep_val_cb
         early_stopping = sweep_early
 
+    # Drop this arm's local handles. If it won, best_X_* still holds them;
+    # if it lost, this is what frees up to 0.83 GB before the next arm.
+    X_tr_sweep = None
+    X_val_sweep = None
+
+
+# The control arm's arrays were held by X_train / X_valid for the whole
+# sweep. If it lost, release them now.
+X_train = None
+X_valid = None
+
+# Point the module-level names at the SELECTED arm, so sections 22B
+# onward - validation diagnostics, threshold tuning, DS2 evaluation - all
+# operate on the window that was actually chosen.
+X_tr_aug = best_X_tr
+X_val = best_X_val
+
 
 # --- selection, still without touching DS2 ------------------------------
 
-SAMPLER_SELECTION_CRITERION = (
-    "highest best val macro-F1 on DS1_VAL across SAMPLER_RATIO_GRID; the "
-    "test set was not evaluated during the sweep and is scored exactly "
-    "once, in section 24, on the selected model"
+WINDOW_SELECTION_CRITERION = (
+    "highest best val macro-F1 on DS1_VAL across WINDOW_GRID; DS2 was not "
+    "loaded at all during the sweep - it is read for the first time in "
+    "section 23B, after this selection, and scored exactly once"
+)
+
+# Conv1D, BatchNormalization and Dense parameter counts depend on the
+# CHANNEL count, and the BiLSTM runs with return_sequences=False so it
+# depends on the feature dimension and its units - none of them on the
+# sequence length. Every arm must therefore have identical parameters; if
+# it does not, something width-dependent crept into build_model.
+_distinct_params = sorted(set(PARAM_COUNTS.values()))
+
+assert len(_distinct_params) == 1, (
+    f"window width changed the parameter count: {PARAM_COUNTS}. The "
+    f"architecture must be shape-agnostic for this sweep to be a "
+    f"single-variable comparison."
 )
 
 print("\n" + "=" * 60)
-print("SAMPLER RATIO SWEEP RESULT")
+print("WINDOW WIDTH SWEEP RESULT")
 print("=" * 60)
-print(f"  {'ratio':>6} {'best val macro-F1':>19} {'best epoch':>11} "
-      f"{'epochs':>7}  weights")
+print(f"  {'window':>14} {'length':>7} {'params':>9} "
+      f"{'best val macro-F1':>19} {'best epoch':>11} {'epochs':>7}")
 
-for entry in SAMPLER_SWEEP:
-    marker = "  <-- selected" if entry["ratio"] == SELECTED_RATIO else ""
-    print(f"  {entry['ratio']:>6.1f} {entry['best_val_macro_f1']:>19.4f} "
-          f"{str(entry['best_epoch']):>11} {entry['epochs_run']:>7}  "
-          f"{[round(v, 4) for v in entry['weights']]}{marker}")
+for entry in WINDOW_SWEEP:
+    marker = ("  <-- selected"
+              if (entry["pre"], entry["post"]) == SELECTED_WINDOW else "")
+    print(f"  ({entry['pre']:>3}, {entry['post']:>3})   "
+          f"{entry['input_length']:>7} {entry['total_parameters']:>9,} "
+          f"{entry['best_val_macro_f1']:>19.4f} "
+          f"{str(entry['best_epoch']):>11} {entry['epochs_run']:>7}"
+          f"{marker}")
 
-print(f"\n  selected ratio  : {SELECTED_RATIO}")
-print(f"  selected weights: {[round(v, 6) for v in SAMPLING_WEIGHTS]}")
-print(f"  criterion: {SAMPLER_SELECTION_CRITERION}")
+print(f"\n  selected window : {SELECTED_WINDOW} "
+      f"-> {SELECTED_INPUT_LENGTH} samples")
+print(f"  parameters      : {_distinct_params[0]:,} (identical for all "
+      f"{len(WINDOW_GRID)} arms)")
+print(f"  criterion: {WINDOW_SELECTION_CRITERION}")
 
 
 # =========================================================
@@ -2205,6 +2397,81 @@ plt.savefig(
 )
 
 plt.show()
+
+
+# =========================================================
+# 23B. LOAD DS2  (first read of the test set, after selection)
+# =========================================================
+
+# This is the first time DS2 is read in this file. The window was chosen
+# on DS1_VAL in section 22 and the decision thresholds were tuned on
+# DS1_VAL in section 22C; both are already fixed by the time these arrays
+# exist, so nothing downstream can leak back into a choice.
+#
+# DS2 is extracted at the SELECTED window, under the same acceptance rule
+# every arm used - the largest window in the grid plus the span cap - so
+# the test population matches the training population exactly.
+
+print("\n" + "=" * 60)
+print(f"LOADING DS2 at the selected window {SELECTED_WINDOW} "
+      f"({SELECTED_INPUT_LENGTH} samples)")
+print("=" * 60)
+
+X_test, y_test, RR_test, _x_raw_test, SEG_STATS_TEST = load_dataset(
+    DS2,
+    DATA_DIR,
+    SELECTED_WINDOW[0],
+    SELECTED_WINDOW[1],
+    LEAD_INDEX
+)
+
+SEGMENTATION_STATS["DS2"] = summarize_segmentation_stats(SEG_STATS_TEST)
+
+print("\nTest shape :", X_test.shape)
+print("Original Test Distribution:")
+print(Counter(y_test))
+
+print(f"\n  {'split':<10} {'cls':>3} {'annot':>7} {'accept':>7} {'E9':>7} "
+      f"{'diff':>6} {'>cap':>6} {'window':>7}")
+for _lab, _row in SEGMENTATION_STATS["DS2"].items():
+    _e9 = E9_ACCEPTED["DS2"][_lab]
+    print(f"  {'DS2':<10} {_lab:>3} {_row['total_annotated']:>7} "
+          f"{_row['accepted']:>7} {_e9:>7} {_row['accepted'] - _e9:>6} "
+          f"{_row['rejected_max_span']:>6} "
+          f"{_row['rejected_accept_window']:>7}")
+
+_counter = Counter(y_test)
+for _lab, _row in SEGMENTATION_STATS["DS2"].items():
+    assert _row["accepted"] == _counter.get(_lab, 0), (
+        f"DS2/{_lab}: stats say {_row['accepted']} accepted but the array "
+        f"holds {_counter.get(_lab, 0)}")
+
+for _lab, _row in SEGMENTATION_STATS["DS2"].items():
+    assert _row["accepted"] == E10_EXPECTED["DS2"][_lab], (
+        f"DS2/{_lab}: accepted {_row['accepted']}, expected "
+        f"{E10_EXPECTED['DS2'][_lab]}")
+
+y_test_encoded = np.array([
+    LABEL_TO_INT[label]
+    for label in y_test
+], dtype=np.int32)
+
+# Same DS1_TRAIN statistics fitted in section 15. Never refitted.
+RR_test = apply_rr_norm(RR_test, RR_NORM_MEAN, RR_NORM_STD)
+
+assert_cnn_input((("test", X_test),), SELECTED_INPUT_LENGTH)
+
+y_test_cat = tf.keras.utils.to_categorical(
+    y_test_encoded,
+    num_classes=NUM_CLASSES
+)
+
+TEST_POPULATION = {
+    str(_lab): int(_count) for _lab, _count in Counter(y_test).items()
+}
+
+print(f"\n  DS2 beats scored: {len(y_test):,} "
+      f"(E9 scored {sum(E9_ACCEPTED['DS2'].values()):,})")
 
 
 # =========================================================
@@ -2503,21 +2770,21 @@ metrics = {
 
         "POST_SAMPLES": POST_SAMPLES,
 
-        "SEGMENT_LENGTH": SEGMENT_LENGTH,
+        "SEGMENT_LENGTH": SEGMENT_LENGTH,   # E9's width, for reference
 
         "LEAD_INDEX": LEAD_INDEX,
 
         # E9: E6's fixed window, E8's acceptance rule. The span cap
-        # decides which beats exist; the model still sees SEGMENT_LENGTH
-        # samples at N_WAVELET_SCALES channels, with no mask and no
-        # padding.
-        "segmentation": "fixed_window_on_span_capped_population",
+        # E10: acceptance is decided once by the LARGEST window in
+        # WINDOW_GRID plus the span cap, so every swept width trains and
+        # tests on identical beats. No mask, no padding.
+        "segmentation": "fixed_window_sweep_on_shared_population",
 
         "max_span_samples": MAX_SPAN_SAMPLES,
 
         "max_span_seconds": MAX_SPAN_SAMPLES / SAMPLING_RATE_HZ,
 
-        "input_length": SEGMENT_LENGTH,
+        "input_length": SELECTED_INPUT_LENGTH,
 
         "n_input_channels": N_WAVELET_SCALES,
 
@@ -2537,13 +2804,24 @@ metrics = {
 
         "sampler": SAMPLER,
 
-        "sampler_ratio_grid": SAMPLER_RATIO_GRID,
-
-        "selected_ratio": SELECTED_RATIO,
-
-        "sampler_selection_criterion": SAMPLER_SELECTION_CRITERION,
+        "sampler_ratio": SAMPLER_RATIO,
 
         "sampling_weights": SAMPLING_WEIGHTS,
+
+        # E10: the swept variable.
+        "window_grid": [list(w) for w in WINDOW_GRID],
+
+        "window_widths": WINDOW_WIDTHS,
+
+        "selected_window": list(SELECTED_WINDOW),
+
+        "selected_input_length": SELECTED_INPUT_LENGTH,
+
+        "window_selection_criterion": WINDOW_SELECTION_CRITERION,
+
+        "accept_window": [ACCEPT_PRE, ACCEPT_POST],
+
+        "accept_window_length": ACCEPT_PRE + ACCEPT_POST,
 
         "steps_per_epoch": STEPS_PER_EPOCH,
 
@@ -2587,16 +2865,18 @@ metrics = {
     # first-of-record, and the S class is identical at 1,565 both sides.
     "segmentation_stats": SEGMENTATION_STATS,
 
-    "e8_population": E8_ACCEPTED,
+    "e9_population": E9_ACCEPTED,
 
-    "population_matches_e8_except": {
-        "beats": 12,
-        "in_ds2": 6,
-        "classes": {"N": 11, "S": 0, "V": 1},
-        "reason": "first annotated beat of a record; the R peak sits "
-                  "28-88 samples in, so the fixed r-90 window starts "
-                  "before sample 0. E8's R-1..R+1 window did not."
-    },
+    "expected_population": E10_EXPECTED,
+
+    "population_rule": (
+        "a beat is accepted iff its R-1..R+1 span is at most "
+        "MAX_SPAN_SAMPLES AND the LARGEST window in WINDOW_GRID "
+        "(ACCEPT_PRE, ACCEPT_POST) fits inside the record. Applied once, "
+        "before the sweep, so all arms train and test on identical beats. "
+        "This is stricter than E9's rule, which only had to fit a "
+        "234-sample window, so E10 scores fewer beats than E9."
+    ),
 
     "train_distribution": {
         str(label): int(count)
@@ -2631,7 +2911,11 @@ metrics = {
 
     "per_class_roc_auc": per_class_roc_auc,
 
-    "sampler_sweep": SAMPLER_SWEEP,
+    "window_sweep": WINDOW_SWEEP,
+
+    "parameter_counts_by_width": {
+        str(_w): int(_n) for _w, _n in sorted(PARAM_COUNTS.items())
+    },
 
     "threshold_weights": [float(w) for w in THRESHOLD_WEIGHTS],
 
