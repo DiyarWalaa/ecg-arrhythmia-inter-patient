@@ -1,143 +1,109 @@
-# Last report — E10: fixed-window width sweep
+# Last report — fix: restore sampler weights call broken by the E10 restructure
 
-**Status: written and verified locally. NOT YET TRAINED.** No `results/E10_*`
-folder and no ablation row; E10 is pre-registered in the generated table.
-E9's artefact was recorded first (18 runs).
+E10 crashed 15 minutes into a Kaggle run. Fixed, root-caused, and the class
+of bug is now checked automatically.
 
----
+## The bug was not what the traceback suggested
 
-## Part 1 — E9 recorded, and it settles what E8 measured
+`weights_for_ratio` **was never removed.** It is still defined, at line 1590.
+The E10 restructure moved the *call* to line 1585 — **five lines above its
+own definition**. `src/train.py` is a script: module scope executes top to
+bottom, so a call above its `def` raises `NameError` exactly as if the
+function did not exist.
 
-| | E9 argmax | E9 tuned | E8 argmax | E6 argmax |
-|---|---|---|---|---|
-| macro-F1 | **0.7032** | 0.7046 | 0.6495 | 0.7263 |
-| S F1 | 0.2976 | 0.3125 | **0.4752** | 0.3641 |
-| V F1 | **0.8548** | 0.8488 | 0.5661 | 0.8503 |
-| accuracy | 0.9226 | 0.9147 | 0.8410 | 0.9352 |
+This distinction decides the fix and the checker. A check that asks only
+"does this name resolve to a module-level def?" — the obvious reading of the
+request — would have **passed** line 1585, because `weights_for_ratio` does
+resolve to a module-level def. The audit has to enforce
+definition-*before*-use for module-scope calls as a separate category. It
+does, and that is the category that fired.
 
-Mechanical predictions exact again: 239,171 params, 302 steps/epoch, train
-35021/637/2878, DS2 37395/1565/3188.
+## The fix: moved the call, kept the derivation
 
-**My substantive prediction was wrong, in the way I named as falsifying it.**
-I predicted E9's S-F1 in [0.40, 0.50] and wrote that below 0.3641 "would mean
-the population story is wrong in both directions". It came in at **0.2976**.
-The span-capped population is *harder* for S, not easier — so **none** of
-E8's S gain came from an easier test set.
+Neither of the two options offered, strictly. Since the helper was never
+removed, restoring it was unnecessary; and I did not inline
+`[1/3, 1/3, 1/3]`.
 
-The clean result, on identical beats (S identical at 1,565 both sides): the
-wide variable window is worth **+0.1776 S-F1** and costs **−0.2887 V-F1**.
-A straight S-against-V trade at a fixed parameter count.
+`SAMPLER_RATIO = 1.0` stays where it is as configuration; the derived line
+`SAMPLING_WEIGHTS = weights_for_ratio(SAMPLER_RATIO)` moved to immediately
+after the definition.
 
-One honest amendment: E9's tuning raised `w_S` to 2.0 — above `w_N` — and the
-result did *not* get worse (+0.0014, noise). The standing threshold rule is
-now three clean confirmations and one flat case, not four.
+**Why derived rather than the literal:** `weights_for_ratio(1.0)` returns
+`[0.3333333333333333] * 3`, byte-for-byte what E9 recorded in
+`config.sampling_weights`, so the sampler behaviour is provably identical to
+E9's — it is computed by the same function every run since E6 has used. A
+hand-typed literal would be numerically identical today but is a second
+source of truth that can drift, which the project convention forbids.
 
----
+Two hunks, both inside section 19B: 14 insertions, 1 deletion.
 
-## Part 2 — E10
+## Dangling-reference audit — 1585 was the only one
 
-### Why
+`tools/check_dangling.py` walks every `ast.Call` whose func is a plain
+`Name` and reports three categories:
 
-E8 and E9 differ in **two** ways: how much **context** the model sees, and
-whether an explicit **length signal** exists (E8's mask channel encodes the
-R−1..R+1 span). A fixed wide window has the context and no length signal, so
-sweeping the fixed width separates them.
+- **UNRESOLVED** — not a module binding, local, import or builtin.
+- **TOO EARLY** — a module-scope call bound further down the file.
+- **LOAD ORDER** (advisory) — a module-scope *read* of a later-bound name.
 
-### What changed
+Calls inside a function to a function defined later are legal and are not
+reported. Locals are over-approximated inside functions, biasing toward
+silence there and keeping the module-scope result trustworthy.
 
-`ast.dump` vs HEAD — **18 functions identical**, including `build_model`,
-`make_balanced_dataset`, `tune_decision_weights`, `load_dataset`, `cwt_ricker`:
+**On the broken file:**
 
-| | |
-|---|---|
-| CHANGED (4) | `extract_beats_from_record`, and the 3 `*_segmentation_stats` helpers (new rejection bucket) |
-| ADDED (2) | `assert_cnn_input`, `load_ds1_for_window` |
+```
+UNRESOLVED  0
+TOO EARLY   1    line 1585  weights_for_ratio(...) is defined at line 1590
+LOAD ORDER  0
+```
 
-`WINDOW_GRID = [(90,144), (140,220), (185,295), (230,370)]` → widths
-**234 / 360 / 480 / 600**, each keeping E9's ≈0.385/0.615 split (measured
-0.3846, 0.3889, 0.3854, 0.3833). Sampler pinned to 1:1:1 (`SAMPLER_RATIO`
-replaces the retired ratio grid); no mask, no padding, no architecture or
-loss change; `DS1_VAL` unchanged.
+**After the fix, across the whole repo:**
 
-### Population control — all four arms on identical beats
-
-Acceptance is decided **once**, by the span cap **and** the largest window in
-the grid `(230, 370)`, then applied to every arm regardless of the width it
-reads. Verified on all 44 records by running the real extraction code: the
-four arms return **byte-identical labels and RR features**, and per-class
-counts agree exactly (a mismatch raises before training).
-
-| split | E9 | E10 | cost |
+| file | unresolved | too early | load order |
 |---|---|---|---|
-| DS1_TRAIN | 35021 / 637 / 2878 | 35006 / 637 / 2877 | −15 N, −1 V |
-| DS1_VAL | 5359 / 273 / 602 | 5358 / 273 / 602 | −1 N |
-| DS2 | 37395 / 1565 / 3188 | **37377 / 1565 / 3187** | −18 N, −1 V |
+| `src/train.py` | 0 | 0 | 0 |
+| `tools/make_ablation.py` | 0 | 0 | 0 |
+| `tools/inspect_ds1.py` | 0 | 0 | 0 |
+| `tools/check_dangling.py` | 0 | 0 | 0 |
 
-**36 beats total — 34 N, 2 V, and no S at any stage.** S has been 1,565 in
-DS2 for E8, E9 and E10 alike, so the S column compares exactly across all
-three. Baked in as a hard assertion; the run aborts if the counts differ.
+**Line 1585 was the only dangling reference in `src/train.py`.** Nothing
+further down will fail this way — including everything after the sweep, in
+section 23B and the DS2 evaluation, which is where another 15 minutes would
+have been lost.
 
-### DS2 is not evaluated inside the sweep — structurally
+The checker has its own negative test: on a deliberately broken file it must
+flag one of each category (it does — unresolved `removed_helper`, too-early
+`helper`, load-order `CONST`) and exit 1, while staying silent and exiting 0
+on a clean file exercising comprehensions, module-level loops, lambdas,
+builtins, `try/except ImportError`, and a function calling a later-defined
+function.
 
-Stronger than the BETA and sampler sweeps, which kept `X_test` in memory and
-relied on the loop not mentioning it. Here **DS2 is not read at all** until
-section 23B, after selection. Proved by AST:
+## Nothing before the crash changed
 
-- Section 22 (sweep) begins line 1940; last `SELECTED_WINDOW` assignment line
-  2125; threshold tuning (validation-only) line 2302; **first DS2 read line
-  2420**, in section 23B.
-- References to any of `X_test`, `y_test`, `RR_test`, `y_test_encoded`,
-  `y_test_cat`, `SEG_STATS_TEST` between the sweep and 23B: **0**.
-- `tune_decision_weights` contains no DS2 name.
+Verified by AST against `HEAD`, 26 items, all identical: `WINDOW_GRID`,
+`ACCEPT_PRE/POST`, `WINDOW_WIDTHS`, `MAX_SPAN_SAMPLES`, `E10_EXPECTED`,
+`E9_ACCEPTED`, `DS1`, `DS2`, `DS1_VAL`, `PRE_SAMPLES`, `POST_SAMPLES`,
+`WAVELET_TARGET_FREQS_HZ`, `RR_FEATURE_NAMES`, `SAMPLER`, `SAMPLER_RATIO`,
+`BATCH_SIZE`, and the definitions of `extract_beats_from_record`,
+`load_dataset`, `build_model`, `make_balanced_dataset`, `weights_for_ratio`,
+`assert_cnn_input`, `load_ds1_for_window`, `cwt_ricker`,
+`summarize_segmentation_stats`.
 
-### Parameter count — identical for every arm
+So the population (35006/637/2877 and 5358/273/602, DS2 37377/1565/3187),
+the acceptance rule, the window grid and the input shape (38520, 234, 9) are
+all untouched.
 
-239,171 for all four widths. Conv1D/BatchNorm counts depend on channels, the
-BiLSTM runs `return_sequences=False` so it depends on feature dim and units,
-and the Dense head sees a fixed 128+16 — none depend on sequence length. The
-same arithmetic reproduces E6's and E9's published 239,171. After three
-`MaxPooling1D(2)` the arms carry 29 / 45 / 60 / 75 timesteps into the BiLSTM.
-A runtime assert refuses to proceed if the arms' counts ever differ.
+## Standing change
 
-### Verification summary
+`CLAUDE.md` now requires **both** local checks before every push, with the
+reason recorded — that `py_compile` checks only syntax and that an
+`ast.dump` function diff will report a moved call site as IDENTICAL, because
+the function itself is unchanged. That combination is what let this reach
+Kaggle.
 
-`python -m py_compile src/train.py` clean · shapes `(n, W, 9)` for
-W ∈ {234, 360, 480, 600} across train/val/test · all finite · wavelet widths
-8.1028 … 0.9003 → 10 … 90 Hz · sampler `[1/3, 1/3, 1/3]`, plain
-`categorical_crossentropy` · `DS1_VAL = ['207','220','223']` · augmentation
-uncalled. Checks ran the **real functions**, AST-extracted and exec'd with
-numpy/wfdb only.
+## Predictions for E10 stand unchanged
 
-### Falsifiable prediction
-
-**Mechanical:** `total_parameters` = **239,171** for every arm ·
-`steps_per_epoch` = **301** (ceil(38520/128); E9 ran 302) · train
-35006/637/2877 · DS2 **42,129** beats 37377/1565/3187 ·
-`parameter_counts_by_width` = {234: 239171, 360: 239171, 480: 239171,
-600: 239171}.
-
-**Substantive.** E8's mask channel is a *direct* encoding of prematurity;
-a wide fixed window only makes the neighbouring beats visible and leaves the
-network to infer timing from morphology it has already shown it cannot use
-(E4 and E5 eliminated capacity and RR attenuation). So I expect **context
-alone to recover less than half** of E8's S gain:
-
-- The selected arm's **test S-F1 lands in [0.30, 0.38]** — above E9's 0.2976,
-  well below E8's 0.4752.
-- Validation **prefers a wider window than 234** (the selected width is 360,
-  480 or 600), because more context helps a little.
-- **V-F1 stays above 0.80**, since no arm has E8's length signal to overfire V.
-
-**What this decides.** S-F1 ≥ 0.42 in any arm ⇒ context is the mechanism and
-the mask channel is incidental. All four arms within ±0.02 of E9's 0.2976 ⇒
-width is irrelevant and the explicit length signal is the whole finding.
-
-**Falsifier for my reasoning:** the 234 control arm winning on validation
-would mean extra context actively hurts, and my "context helps a little"
-premise is wrong.
-
-## Not done
-
-- E10 not trained. Runtime note: the sweep re-extracts DS1 per arm, so
-  extraction cost is ~7× E9's, plus four training runs.
-- Record 114's swapped leads (known fact 2) remain unfixed — out of scope.
+239,171 parameters for every arm · `steps_per_epoch` 301 · train
+35006/637/2877 · DS2 42,129 beats · selected arm's test S-F1 in [0.30, 0.38]
+· a wider-than-234 arm wins on validation · V-F1 above 0.80.

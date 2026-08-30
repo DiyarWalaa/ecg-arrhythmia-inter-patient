@@ -275,11 +275,35 @@ to change where it runs:
 ## Environment
 
 - **No TensorFlow locally.** `src/train.py` cannot be run on this machine.
-  The only local check available is:
+  Run BOTH local checks before every push:
 
   ```
-  python -m py_compile src/train.py
+  python -m py_compile src/train.py        # syntax
+  python tools/check_dangling.py           # names that will not resolve
   ```
+
+  **`py_compile` alone is not enough, and neither is an `ast.dump` diff.**
+  E10 crashed 15 minutes into a Kaggle run on
+  `SAMPLING_WEIGHTS = weights_for_ratio(SAMPLER_RATIO)` - a call that a
+  restructure had moved ABOVE the definition it calls. `py_compile` passed
+  (valid syntax); the `ast.dump` function diff passed and reported
+  `weights_for_ratio` IDENTICAL, correctly, because the function was never
+  touched. Only the call site had moved.
+
+  `tools/check_dangling.py` reports three things and exits non-zero on the
+  first two:
+
+  - **UNRESOLVED** - a called name that is not a module binding, a local, an
+    import or a builtin.
+  - **TOO EARLY** - a call in MODULE scope whose target is bound further
+    down the file. `src/train.py` executes top to bottom, so for module
+    scope "defined later" fails exactly like "not defined". This is the
+    E10 bug, and a resolve-only checker would have passed it.
+  - **LOAD ORDER** (advisory) - a module-scope read of a name bound later.
+
+  A call inside a function to a function defined later is legal and is not
+  reported. The checker has negative tests: it must flag all three
+  categories on a deliberately broken file and stay silent on a clean one.
 
 - `tools/` scripts need only `wfdb` and `numpy` and do run locally:
 

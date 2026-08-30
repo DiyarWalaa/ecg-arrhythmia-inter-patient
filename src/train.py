@@ -1582,7 +1582,12 @@ SAMPLER = "balanced_batch"
 # ratio-1.0 arm reproduced E6's selection (0.5540 at epoch 6) exactly.
 SAMPLER_RATIO = 1.0
 
-SAMPLING_WEIGHTS = weights_for_ratio(SAMPLER_RATIO)
+# SAMPLING_WEIGHTS is derived from SAMPLER_RATIO just below
+# weights_for_ratio(), which is defined further down this section. This
+# file is a script: module scope runs top to bottom, so a call placed
+# above its def raises NameError no matter that the def exists. That is
+# exactly how E10 first crashed, 15 minutes into a run - see
+# tools/check_dangling.py, which now refuses that shape.
 
 STEPS_PER_EPOCH = int(np.ceil(len(y_tr_aug) / BATCH_SIZE))
 
@@ -1600,6 +1605,14 @@ def weights_for_ratio(ratio, n_classes=NUM_CLASSES, minority_index=1):
     total = sum(raw)
 
     return [w / total for w in raw]
+
+
+# E10 fixes the sampler at E6's 1:1:1 rather than sweeping it, but the
+# weights are still DERIVED by the same function every run since E6 used,
+# not typed in as a literal. weights_for_ratio(1.0) returns exactly
+# [1/3, 1/3, 1/3], which is byte-for-byte what E9 recorded in
+# config.sampling_weights, so the sampler behaviour is unchanged.
+SAMPLING_WEIGHTS = weights_for_ratio(SAMPLER_RATIO)
 
 
 def make_balanced_dataset(weights):
